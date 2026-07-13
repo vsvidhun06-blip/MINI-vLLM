@@ -10,8 +10,12 @@ production-engineering level — every line written by hand, with Hugging
 Face parity tests as the correctness anchor at each layer of the stack.
 
 ## Hero
+![Mini-vLLM live visualiser](docs/screenshots/hero_v2.png)
 
-
+*Four concurrent requests in the DECODE phase. Each colour is one
+request_id, hashed deterministically so the same hue appears in the
+status row, the cache grid, and the event log. 9 of 64 KV blocks in
+use; ~12.6 tokens/sec on CPU.*
 
 ## v0.1 benchmarks
 
