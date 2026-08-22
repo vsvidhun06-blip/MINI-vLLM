@@ -183,8 +183,20 @@ class LoRALinear(nn.Module):
     # ---- forward ------------------------------------------------------------
 
     def forward(self, x: torch.Tensor, adapter_id: str | None = None) -> torch.Tensor:
+        """Base forward plus the LoRA delta selected by `adapter_id` or state.
+
+        `adapter_id` is an OVERRIDE-ONLY hook (a convenience for unit tests):
+        a str overrides the routing state for this call, and None means "no
+        override, use self._active". It is deliberately NOT the place to express
+        "route to base" -- nothing calls this with an explicit None, because the
+        model's attention blocks invoke it as `proj(x)` with no routing argument
+        at all. Base routing is expressed by set_active(None), which is what
+        LoRALlamaModel.forward(..., adapter_ids=None) does. Giving this parameter
+        a sentinel default would add an unused code path; the omitted-vs-explicit
+        distinction is resolved one level up, where callers actually make it.
+        """
         base_out = self.base(x)
-        # Explicit arg wins; otherwise use the externally-set routing state.
+        # Explicit override wins; otherwise use the externally-set routing state.
         active: ActiveSpec = adapter_id if adapter_id is not None else self._active
         if active is None:
             # Zero-overhead path: identical to the wrapped nn.Linear.

@@ -17,6 +17,21 @@ Two activation modes, both routed down to every wrapped LoRALinear:
                                   mixed-adapter batching that lets one batched
                                   forward serve several fine-tunes at once.
 
+ROUTING STATE IS STICKY, AND `None` MEANS BASE
+----------------------------------------------
+The active routing plan persists across forwards until it is changed -- the
+scheduler relies on that (it sets the plan once per step, and generate() sets it
+once for a whole prefill+decode sequence). So `forward` has to distinguish two
+different things a caller can mean:
+
+    forward(ids)                    -- argument OMITTED: keep the current plan.
+    forward(ids, adapter_ids=None)  -- argument EXPLICITLY None: route to base.
+
+A plain `None` default cannot express both, so the omitted case is spelled with
+the `UNSET` sentinel below. `None` therefore means "base" everywhere in this
+module -- as a whole-batch plan, as a per-row entry, and as generate()'s
+adapter_id -- with no stale-state exception.
+
 DROP-IN FOR THE SCHEDULER
 -------------------------
 forward(input_ids, kv_cache=...) matches LlamaModel.forward, and `.config` /
@@ -32,7 +47,8 @@ the same pattern.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from enum import Enum, auto
+from typing import TYPE_CHECKING, Final, List, Literal, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -44,6 +60,28 @@ if TYPE_CHECKING:
 
 # The four attention projections we wrap, by attribute name on MultiHeadAttention.
 _TARGET_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj")
+
+# A routing plan a caller can hand to forward(): one adapter for every row, a
+# per-row list (None entry = that row is base-only), or None = base for all rows.
+RoutingSpec = Union[str, List[Optional[str]], None]
+
+
+class _Sentinel(Enum):
+    """Single-member enum used as a typed sentinel.
+
+    The enum form (rather than `object()`) is what static checkers can narrow:
+    `Literal[_Sentinel.UNSET]` in the union lets `is not UNSET` refine the
+    parameter down to RoutingSpec inside the branch.
+    """
+    UNSET = auto()
+
+    def __repr__(self) -> str:                      # nicer signature rendering
+        return "UNSET"
+
+
+#: Default for forward()'s `adapter_ids`: the argument was omitted, so the
+#: existing routing state is preserved. Distinct from an explicit None (= base).
+UNSET: Final = _Sentinel.UNSET
 
 
 def layer_name(layer_idx: int, proj: str) -> str:
@@ -95,8 +133,12 @@ class LoRALlamaModel(nn.Module):
         """Per-row routing for a mixed-adapter batch.
 
         adapter_ids[i] is the adapter for batch row i (None = base only). Passing
-        None clears routing back to the base path. The list is shared by
-        reference across all wrapped layers -- they all see the same per-row plan.
+        None (rather than a list) clears routing back to the base path for the
+        whole batch. The list is shared by reference across all wrapped layers --
+        they all see the same per-row plan.
+
+        Unlike forward(), there is no omitted case here: calling this method is
+        itself the request to change routing, so None is unambiguously "base".
         """
         active: ActiveSpec = adapter_ids
         for layer in self._lora_layers:
@@ -111,19 +153,28 @@ class LoRALlamaModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         kv_cache=None,
-        adapter_ids: "list[str | None] | str | None" = None,
+        adapter_ids: RoutingSpec | Literal[_Sentinel.UNSET] = UNSET,
     ):
         """Drop-in for LlamaModel.forward, plus optional adapter routing.
 
         adapter_ids:
-            * None  -- use whatever routing was last set (set_adapter /
-                       set_batch_adapters), or base if nothing set.
-            * str   -- apply this one adapter to every row for this call.
-            * list  -- per-row routing for this call (len == batch size).
-        When given, it is applied for THIS call (it sets the routing state).
+            * omitted -- preserve the routing state last set (set_adapter /
+                         set_batch_adapters / a previous forward), or base if
+                         nothing has ever been set. This is the scheduler's and
+                         generate()'s path: they set the plan, then forward.
+            * None    -- explicitly route every row to the base path, discarding
+                         any previously-set plan. NOT "leave state alone".
+            * str     -- apply this one adapter to every row.
+            * list    -- per-row routing (len == batch size), None entry = base.
+
+        Anything other than the omitted case sets the routing state, so it also
+        applies to subsequent forwards until changed -- decode steps of one
+        generation inherit the prefill's plan, which is what the KV-cache loop
+        wants.
         """
-        if adapter_ids is not None:
-            if isinstance(adapter_ids, str):
+        if adapter_ids is not UNSET:
+            # str and None are both whole-batch plans; a list is per-row.
+            if adapter_ids is None or isinstance(adapter_ids, str):
                 self.set_adapter(adapter_ids)
             else:
                 self.set_batch_adapters(adapter_ids)
