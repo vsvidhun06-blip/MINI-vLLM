@@ -57,6 +57,17 @@ import torch.nn as nn
 ActiveSpec = "str | list[str | None] | None"
 
 
+
+
+def normalize_routing_plan(active: ActiveSpec):
+    """Return a hashable canonical routing plan for graph-capture comparison."""
+    if active is None:
+        return None
+    if isinstance(active, str):
+        return active
+    plan = tuple(active)
+    return None if all(adapter_id is None for adapter_id in plan) else plan
+
 @dataclass
 class LoRAAdapter:
     """One registered adapter.

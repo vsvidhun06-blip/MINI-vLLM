@@ -53,7 +53,7 @@ from typing import TYPE_CHECKING, Final, List, Literal, Optional, Union
 import torch
 import torch.nn as nn
 
-from src.engine.lora import ActiveSpec, LoRALinear, LoRAManager
+from src.engine.lora import ActiveSpec, LoRALinear, LoRAManager, normalize_routing_plan
 
 if TYPE_CHECKING:
     from src.engine.model import LlamaModel
@@ -83,6 +83,20 @@ class _Sentinel(Enum):
 #: existing routing state is preserved. Distinct from an explicit None (= base).
 UNSET: Final = _Sentinel.UNSET
 
+
+
+
+def model_routing_plan(model) -> tuple[str | None, ...] | str | None:
+    """Return the model's current routing plan in canonical form.
+
+    Plain LlamaModel instances have no LoRA routing state and return None.
+    A single adapter is returned as its string id; mixed routing is returned
+    as a tuple so graph-capture comparisons are stable and hashable.
+    """
+    layers = getattr(model, "_lora_layers", None)
+    if not layers:
+        return None
+    return normalize_routing_plan(layers[0]._active)
 
 def layer_name(layer_idx: int, proj: str) -> str:
     """Canonical adapter-weight key for one wrapped projection."""

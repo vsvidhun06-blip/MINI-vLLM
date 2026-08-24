@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from src.engine import events
+from src.engine.lora_model import model_routing_plan
 from src.engine.kv_cache import PagedKVCache, PagedRequestCache
 
 if TYPE_CHECKING:
@@ -289,13 +290,32 @@ class ContinuousBatchScheduler:
         # that pre-captures graphs). It stays None during ordinary scheduler
         # use, so the decode path is the eager one and existing tests see no
         # behavioural change. See _decode_forward.
+        #
+        # SETTING use_cuda_graphs=True IS NOT ENOUGH. `_decode_forward` also
+        # requires `_graph_runner is not None`, so a caller that only flips this
+        # flag runs EAGER on every decode step -- which is exactly how the first
+        # T4 batch-intervention smoke produced two "CUDA graph" arms with
+        # cuda_graph_hits == 0. To actually get graphs, attach a runner:
+        #   from src.engine.live_graph import LiveDecodeGraphRunner
+        #   runner = LiveDecodeGraphRunner(model, sched.pool,
+        #                                  max_batch_size=..., max_context_tokens=...)
+        #   runner.capture_all()      # BEFORE admitting any request
+        #   sched._graph_runner = runner
+        # and read cuda_graph_observer to confirm hits > 0 rather than trusting
+        # the flag. src/engine/cuda_graph.CUDAGraphRunner is the fixed-seq_len
+        # MICROBENCHMARK runner and cannot serve live decode; see that module.
         self.use_cuda_graphs = use_cuda_graphs
         self._graph_runner = None  # type: ignore[assignment]
+        self._routing_plan = None
         # Optional observability hook: called once per batched-decode forward
         # with True if a captured CUDA graph was replayed, False if we fell back
         # to eager. Stays None during ordinary use (no metrics dependency in the
         # engine); the server wires metrics.observe_cuda_graph into it.
         self._cuda_graph_observer = cuda_graph_observer
+        # Exactly one entry per batched-decode forward, keyed by why it went
+        # where it went: graph_hit / graphs_disabled / graph_runner_missing /
+        # runner_rejected. See _decode_forward and graph_diagnostics().
+        self._graph_reason_counts: dict[str, int] = {}
 
         # The KV pool. One big tensor shared across all requests. The pool
         # also gets the event_bus so block_allocated / block_freed fire
@@ -389,20 +409,84 @@ class ContinuousBatchScheduler:
         pre-graph code path, so on CPU (and whenever no graph matches) behaviour
         is unchanged.
         """
-        if (
-            self.use_cuda_graphs
-            and self.device.type == "cuda"
-            and self._graph_runner is not None
-            and self._graph_runner.can_replay(len(caches), caches)
-        ):
-            if self._cuda_graph_observer is not None:
-                self._cuda_graph_observer(True)   # graph hit
-            # The graph runs under its own captured no_grad context.
-            return self._graph_runner.replay(input_ids, caches)
+        # The device check that used to sit here was redundant and actively
+        # harmful: `_graph_runner` is None unless a caller deliberately attaches
+        # one, and LiveDecodeGraphRunner refuses to construct on a non-CUDA pool,
+        # so CPU can never reach the graph branch by accident. What the check DID
+        # do was make the routing untestable without a GPU -- the T4 run would be
+        # the first execution of this branch. Authority now rests with the
+        # runner's `can_replay`, which validates batch size, KV pool identity,
+        # per-layer context agreement and context bucket, and records a reason
+        # for every refusal.
+        #
+        # WHY THE REASON COUNTERS EXIST. Two T4 smoke runs reported
+        # cuda_graph_hits == 0 with no way to tell WHICH condition failed --
+        # flag off, runner never attached, or runner attached and refusing. Each
+        # has a completely different fix, and "fallbacks == decode steps" looks
+        # identical in all three. The branch now records exactly one reason for
+        # every decode forward, so `graph_fallback_reasons` alone identifies the
+        # failure without a rerun. `graph_runner_missing` in particular is the
+        # signature of running code that predates the runner attachment.
+        if not self.use_cuda_graphs:
+            return self._eager_decode(input_ids, caches, "graphs_disabled")
+        if self._graph_runner is None:
+            return self._eager_decode(input_ids, caches, "graph_runner_missing")
+        routing_plan = self._routing_plan
+        if isinstance(routing_plan, list) and len(routing_plan) != len(caches):
+            return self._eager_decode(input_ids, caches, "routing_plan_stale")
+        routing_plan = model_routing_plan(self.model)
+        if not self._graph_runner.can_replay(len(caches), caches, routing_plan):
+            # The runner has already recorded the specific sub-reason (batch
+            # size, KV pool identity, ragged contexts, bucket) in its own
+            # `fallback_reasons`; this counter records that the runner is the
+            # one refusing, as opposed to it being absent.
+            return self._eager_decode(input_ids, caches, "runner_rejected")
+
+        self._graph_reason_counts["graph_hit"] = (
+            self._graph_reason_counts.get("graph_hit", 0) + 1)
+        if self._cuda_graph_observer is not None:
+            self._cuda_graph_observer(True)   # graph hit
+        # The graph runs under its own captured no_grad context.
+        return self._graph_runner.replay(input_ids, caches)
+
+    def _eager_decode(
+        self,
+        input_ids: torch.Tensor,
+        caches: list,
+        reason: str,
+    ) -> torch.Tensor:
+        """The eager batched-decode forward, plus the reason we took it.
+
+        Byte-identical to the pre-graph code path; `reason` is pure
+        bookkeeping.
+        """
+        self._graph_reason_counts[reason] = (
+            self._graph_reason_counts.get(reason, 0) + 1)
         if self._cuda_graph_observer is not None:
             self._cuda_graph_observer(False)      # eager fallback
         with torch.no_grad():
             return self.model(input_ids, kv_cache=caches)
+
+    def graph_diagnostics(self) -> dict:
+        """Why every batched-decode forward went where it went.
+
+        `reasons` sums to the number of batched-decode forwards. `runner` holds
+        the attached runner's finer-grained refusal reasons, or None when no
+        runner is attached -- which is itself the diagnosis.
+        """
+        runner = self._graph_runner
+        return {
+            "reasons": dict(self._graph_reason_counts),
+            "graph_runner_attached": runner is not None,
+            "graph_runner_class": (
+                f"{type(runner).__module__}.{type(runner).__qualname__}"
+                if runner is not None else None),
+            "runner_fallback_reasons": (
+                dict(getattr(runner, "fallback_reasons", {}))
+                if runner is not None else None),
+            "runner_report": (
+                runner.report() if hasattr(runner, "report") else None),
+        }
 
     # ---- Public API ---------------------------------------------------
 
