@@ -55,9 +55,11 @@ REPORTING
 ---------
 For each knob: throughput_tps (mean +/- std over seeds), delta_vs_full
 (CARL-Full - frozen), and the knob's share of the scheduler gain. The raw deltas
-are NORMALISED to sum to the ablation's headline +28.51 tok/s so the per-knob
-numbers are directly comparable to that single block (pct_of_scheduler_gain =
-raw_delta / sum(raw_deltas) * 100; normalized_delta_tps = that share of 28.51).
+are reported RAW, alongside the pooled standard deviation and whether the delta
+exceeds 1 and 2 standard deviations. They are deliberately NOT rescaled to sum to
+any headline number: forcing parts to add to a total taken from another
+experiment converts noise into a tidy-looking decomposition. See the Phase 14
+note at the normalisation site.
 
 Run (on a GPU box / Colab T4, like ablation_live.py):
   python scripts/eval/knob_attribution.py                       # N=10, 50 reqs
@@ -122,7 +124,10 @@ KNOBS = [
 # a no-op for inference and the measured delta is bandit-shuffle noise ~= 0.
 _LIVE_EFFECTIVE_KNOBS = {"max_batch_size", "chunk_size"}
 
-# The single-block scheduler contribution this decomposition normalises against.
+# Retained for REFERENCE ONLY (printed for context, never used to rescale).
+# Its source artifact is quarantined as hand-reconstructed: see
+# docs/eval/legacy/README.md.
+# The single-block scheduler contribution previously normalised against.
 # Source: docs/eval/ablation_live_results.json -> subsystem_contributions ->
 # {"subsystem": "Sched", "delta_tps": 28.51} (CARL-Full - CARL-NoSched).
 SCHEDULER_ABLATION_DELTA_TPS = 28.51
@@ -268,6 +273,7 @@ def run_all(seeds: list, n: int) -> dict:
                                        freeze=None)
     full_agg = _aggregate(full_runs)
     full_tput = full_agg["throughput_tps_mean"]
+    full_std = full_agg.get("throughput_tps_std") or 0.0
 
     # 2. One config per knob: pin THAT knob at Static-Best, adapt the rest.
     knob_aggs: dict = {}
@@ -281,7 +287,26 @@ def run_all(seeds: list, n: int) -> dict:
         if runs:
             knob_aggs[knob] = (frozen_val, _aggregate(runs))
 
-    # 3. Deltas + normalisation onto the scheduler ablation's headline number.
+    # 3. RAW deltas. Deliberately NOT normalised -- see the note below.
+    #
+    # PHASE 14 REPAIR. This block previously rescaled every raw delta so the set
+    # summed to the ablation's headline +28.51 tok/s:
+    #
+    #     pct              = raw_delta / delta_sum * 100
+    #     normalized_delta = raw_delta / delta_sum * 28.51
+    #
+    # That is not an attribution, it is a re-expression. It (a) forces the parts
+    # to sum to a number taken from a DIFFERENT experiment -- one whose artifact
+    # is now quarantined as hand-reconstructed, see docs/eval/legacy/README.md --
+    # (b) manufactures a tidy percentage decomposition even when the raw deltas
+    # are all inside run-to-run noise, and (c) inverts sign meaning when the
+    # deltas do not share a sign, because `delta_sum` can be near zero or
+    # negative. The question this experiment answers is "which control variable
+    # causes the measured change", not "how do we split a fixed total into
+    # shares that add to 100".
+    #
+    # Raw deltas are reported with their standard deviations so a reader can see
+    # directly whether a knob's effect exceeds noise.
     raw_deltas = {
         k: full_tput - agg["throughput_tps_mean"] for k, (_v, agg) in knob_aggs.items()
     }
@@ -293,13 +318,10 @@ def run_all(seeds: list, n: int) -> dict:
             continue
         frozen_val, agg = knob_aggs[knob]
         raw_delta = raw_deltas[knob]
-        # Share of the (signed) total. Guard a ~0 denominator so a degenerate run
-        # reports null shares instead of dividing by zero.
-        if abs(delta_sum) > 1e-9:
-            pct = raw_delta / delta_sum * 100.0
-            normalized = raw_delta / delta_sum * SCHEDULER_ABLATION_DELTA_TPS
-        else:
-            pct = normalized = None
+        # Is this knob's effect distinguishable from run-to-run noise? Reported
+        # instead of a normalised share: a delta smaller than the pooled std is
+        # not evidence of a contribution, however tidy its percentage looks.
+        pooled_std = ((agg["throughput_tps_std"] ** 2 + full_std ** 2) / 2.0) ** 0.5
         knobs_out[knob] = {
             "frozen_value": frozen_val,
             "live_effective": knob in _LIVE_EFFECTIVE_KNOBS,
@@ -309,8 +331,9 @@ def run_all(seeds: list, n: int) -> dict:
             "ttft_p99_std": agg["ttft_p99_std"],
             "slo_rate_mean": agg["slo_rate_mean"],
             "delta_vs_full": raw_delta,
-            "pct_of_scheduler_gain": pct,
-            "normalized_delta_tps": normalized,
+            "delta_pooled_std": pooled_std,
+            "delta_exceeds_1std": abs(raw_delta) > pooled_std if pooled_std else None,
+            "delta_exceeds_2std": abs(raw_delta) > 2 * pooled_std if pooled_std else None,
         }
 
     ranked = sorted(knobs_out.items(),
@@ -343,12 +366,17 @@ def run_all(seeds: list, n: int) -> dict:
         "knobs": knobs_out,
         "ranked_by_delta": [
             {"knob": k, "delta_vs_full": v["delta_vs_full"],
-             "pct_of_scheduler_gain": v["pct_of_scheduler_gain"],
-             "normalized_delta_tps": v["normalized_delta_tps"],
+             "delta_pooled_std": v["delta_pooled_std"],
+             "delta_exceeds_2std": v["delta_exceeds_2std"],
              "live_effective": v["live_effective"]}
             for k, v in ranked
         ],
         "raw_delta_sum_tps": delta_sum,
+        "normalisation_note": (
+            "Deltas are RAW. They are deliberately not rescaled to sum to the "
+            "ablation's headline scheduler gain; see the Phase 14 note in this "
+            "script. Judge a knob by delta_vs_full against delta_pooled_std, "
+            "not by a share of a total."),
         "live_effective_knobs": sorted(_LIVE_EFFECTIVE_KNOBS),
         "scope_note": ("Single-model live harness (CARL wired to the scheduler "
                        "only; router/kv_cache/spec_decoder are None; speculation "
@@ -384,8 +412,8 @@ def _print(results: dict) -> None:
     print("| " + " | ".join("---" for _ in headers) + " |")
     for k, v in results["knobs"].items():
         live = "yes" if v["live_effective"] else "no*"
-        pct = "n/a" if v["pct_of_scheduler_gain"] is None else f"{v['pct_of_scheduler_gain']:.1f}"
-        norm = "n/a" if v["normalized_delta_tps"] is None else f"{v['normalized_delta_tps']:+.2f}"
+        pct = "n/a" if v.get("delta_pooled_std") is None else f"{v['delta_pooled_std']:.2f}"
+        norm = "yes" if v.get("delta_exceeds_2std") else "no"
         print("| " + " | ".join([
             f"{k}={v['frozen_value']}", live,
             f"{v['throughput_tps_mean']:.1f} +/- {v['throughput_tps_std']:.1f}",

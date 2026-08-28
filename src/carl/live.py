@@ -123,9 +123,69 @@ class _ReqSpec:
     prompt_ids: torch.Tensor
     max_new: int
     phase: int
+    # PHASE 10: offset (seconds) from run start at which this request should be
+    # SUBMITTED. 0.0 for every request reproduces the legacy bulk dump; a
+    # positive, distribution-drawn offset makes this an open-loop arrival
+    # process. See build_arrivals().
+    arrival_offset_s: float = 0.0
 
 
-def _build_workload(tokenizer, scenario: str, n: int, rng) -> list[_ReqSpec]:
+# ---------------------------------------------------------------------------
+# PHASE 10: arrival processes.
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. The original harness submitted every phase-0 request inside a
+# single loop at t0, then dumped every phase-1 request the instant half of
+# phase 0 had finished. There is no arrival process at all: it is a closed-loop
+# bulk dump. That matters because the paper's headline latency claim -- static
+# TTFT p99 of 18,058 ms against CARL's 2,199 ms -- is dominated by queueing
+# delay behind a concurrency cap, which is a property of dumping N requests at
+# once, not a property of serving. A 1.1B model on a T4 does not have an
+# 18-second TTFT under any realistic arrival pattern.
+#
+# The bulk dump is NOT removed. It is retained as ARRIVAL_BURST, a legitimate
+# stress case, so that "burst" and "steady serving" become two measurable
+# conditions rather than one condition described two ways.
+# ---------------------------------------------------------------------------
+
+ARRIVAL_BURST = "burst"                  # legacy behaviour: everything at t=0
+ARRIVAL_POISSON = "poisson"              # exponential inter-arrival at rate lambda
+ARRIVAL_DETERMINISTIC = "deterministic"  # fixed 1/lambda spacing
+
+ARRIVAL_PROCESSES = (ARRIVAL_BURST, ARRIVAL_POISSON, ARRIVAL_DETERMINISTIC)
+
+
+def build_arrivals(n: int, process: str, rate_rps: float, rng,
+                   t_offset: float = 0.0) -> list[float]:
+    """Arrival offsets (seconds from run start) for `n` requests.
+
+    Args:
+        process: one of ARRIVAL_PROCESSES.
+        rate_rps: lambda, requests/second. Ignored for ARRIVAL_BURST.
+        rng: a random.Random.
+        t_offset: added to every offset, so phases can be spliced back to back.
+
+    Choosing `rate_rps`: it should be set from a measured service rate so the
+    offered load rho = lambda / mu is a stated experimental condition rather
+    than an accident. scripts/eval/arrival_probe.py measures mu; running a
+    workload at unstated rho is how the original harness ended up permanently
+    saturated without anyone noticing.
+    """
+    if process not in ARRIVAL_PROCESSES:
+        raise ValueError(f"unknown arrival process {process!r}; "
+                         f"expected one of {ARRIVAL_PROCESSES}")
+    if process == ARRIVAL_BURST:
+        return [t_offset] * n
+    rate = max(float(rate_rps), 1e-9)
+    out, t = [], t_offset
+    for _ in range(n):
+        out.append(t)
+        t += rng.expovariate(rate) if process == ARRIVAL_POISSON else 1.0 / rate
+    return out
+
+
+def _build_workload(tokenizer, scenario: str, n: int, rng,
+                    arrival: str = ARRIVAL_BURST, rate_rps: float = 2.0):
     """Build the `n` request specs for a scenario.
 
     INTERACTIVE / BATCH: all phase 0, lengths drawn from the scenario's window.
@@ -138,19 +198,27 @@ def _build_workload(tokenizer, scenario: str, n: int, rng) -> list[_ReqSpec]:
         half = n // 2
         inter = _SCENARIO_SPEC["INTERACTIVE"]
         batch = _SCENARIO_SPEC["BATCH"]
+        a0 = build_arrivals(half, arrival, rate_rps, rng)
         for i in range(half):
             L = rng.randint(inter["prompt_lo"], inter["prompt_hi"])
-            specs.append(_ReqSpec(f"i{i}", _make_prompt(tokenizer, L), inter["max_new"], 0))
+            specs.append(_ReqSpec(f"i{i}", _make_prompt(tokenizer, L),
+                                  inter["max_new"], 0, arrival_offset_s=a0[i]))
+        # Phase 1 arrivals continue from where phase 0 ended, so the regime flip
+        # is a change in the STREAM rather than a synchronised dump.
+        t1 = max(a0) if a0 else 0.0
+        a1 = build_arrivals(n - half, arrival, rate_rps, rng, t_offset=t1)
         for i in range(n - half):
             L = rng.randint(batch["prompt_lo"], batch["prompt_hi"])
-            specs.append(_ReqSpec(f"b{i}", _make_prompt(tokenizer, L), batch["max_new"], 1))
+            specs.append(_ReqSpec(f"b{i}", _make_prompt(tokenizer, L),
+                                  batch["max_new"], 1, arrival_offset_s=a1[i]))
         return specs
 
     spec = _SCENARIO_SPEC[scenario]
+    offsets = build_arrivals(n, arrival, rate_rps, rng)
     for i in range(n):
         L = rng.randint(spec["prompt_lo"], spec["prompt_hi"])
         specs.append(_ReqSpec(f"{scenario[:3].lower()}{i}", _make_prompt(tokenizer, L),
-                              spec["max_new"], 0))
+                              spec["max_new"], 0, arrival_offset_s=offsets[i]))
     return specs
 
 

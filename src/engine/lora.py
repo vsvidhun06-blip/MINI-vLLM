@@ -37,6 +37,25 @@ WHAT'S HERE
                    a genuine zero-overhead path when no adapter is active, and
                    per-row routing for mixed-adapter batches.
 
+PER-ROW ROUTING METADATA IS PREPARED, NOT BUILT IN forward()
+------------------------------------------------------------
+`_apply_per_row` groups the batch rows by adapter and gathers/scatters each
+group with an index tensor. Building that index tensor inside forward -- which
+is what this module used to do, `torch.tensor(rows, device=cuda)` once per
+wrapped projection per step -- is a PAGEABLE host->device copy, and CUDA stream
+capture rejects it outright:
+
+    RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA graph
+    capture unless the CPU tensor is pinned.
+
+so every routed decode graph failed to capture and the routed arm silently
+degraded to eager. The indices are therefore built in `set_active()` -- which
+runs on the host, outside any capture -- and cached on the device that holds the
+wrapped projection's weights. `forward` only READS them, so a routed capture
+launches nothing but kernels and the captured graph keeps pointing at index
+tensors that stay alive at a stable address for as long as that plan can be
+replayed. See `src/engine/live_graph.py` for the capture side.
+
 The base weights live in the wrapped nn.Linear and are never mutated. Adapters
 carry only their A/B matrices. Nothing here depends on the server or scheduler.
 """
@@ -57,6 +76,18 @@ import torch.nn as nn
 ActiveSpec = "str | list[str | None] | None"
 
 
+
+
+# How many DISTINCT per-row plans one LoRALinear keeps prepared index tensors
+# for. Entries are tiny (one int64 row-index tensor per adapter in the plan, at
+# most `batch_size` elements each), and they are retained rather than rebuilt
+# because a captured CUDA graph BAKES IN the address of the index tensor it was
+# captured with: freeing a plan's indices while a graph captured under that plan
+# can still be replayed would leave the graph reading recycled memory. The cap
+# is deliberately far above `LiveDecodeGraphRunner.max_routed_graphs` (16), the
+# number of routed plans that can ever own a graph, and eviction is LRU so a
+# plan that is still being served is never the one dropped.
+_ROUTING_CACHE_MAX = 64
 
 
 def normalize_routing_plan(active: ActiveSpec):
@@ -185,11 +216,74 @@ class LoRALinear(nn.Module):
         self.layer_name = layer_name
         # Active routing spec; None => pure base path.
         self._active: ActiveSpec = None
+        # Per-row routing metadata, prepared by set_active() and only READ by
+        # forward(). See the module docstring for why it cannot be built inside
+        # forward: on CUDA that is a pageable H2D copy, which stream capture
+        # rejects. `_routing_plan` is the canonical tuple `_routing_groups`
+        # describes, or None when no per-row plan is installed (base and
+        # single-adapter routing need no indices at all).
+        self._routing_plan: "tuple | None" = None
+        self._routing_groups: list[tuple[str, torch.Tensor]] = []
+        self._routing_device: "torch.device | None" = None
+        # plan -> groups, LRU. Retained so a captured graph's index tensors
+        # outlive a plan change; see _ROUTING_CACHE_MAX.
+        self._routing_cache: "OrderedDict[tuple, list[tuple[str, torch.Tensor]]]" = OrderedDict()
 
     # ---- activation control (called by LoRALlamaModel) ----------------------
 
     def set_active(self, active: ActiveSpec) -> None:
+        """Install a routing plan AND prepare the metadata its forward needs.
+
+        Preparation belongs here, not in forward(), because this is host-side
+        code that runs between steps -- outside any CUDA graph capture -- while
+        forward() is exactly what a capture records. Base (`None`) and
+        single-adapter (`str`) routing need no metadata, so they only clear it;
+        the zero-overhead base path allocates nothing here either.
+        """
         self._active = active
+        if isinstance(active, (list, tuple)):
+            self._prepare_row_routing(tuple(active), self.base.weight.device)
+        else:
+            self._routing_plan = None
+            self._routing_groups = []
+
+    def _prepare_row_routing(self, plan: tuple, device: "torch.device") -> None:
+        """Build (or reuse) the on-device row-index tensors for `plan`.
+
+        One int64 tensor per distinct adapter in the plan, holding that
+        adapter's batch row indices, on `device`. Reusing the cached tensors
+        when the same plan is re-installed is not just an optimisation: a graph
+        captured under this plan launched its index_select/index_add with THESE
+        pointers, so handing it a fresh allocation would silently change what it
+        gathers.
+        """
+        if self._routing_device is not None and self._routing_device != device:
+            # The module was moved (`.to(...)`) since the last plan. Nothing
+            # cached is addressable on the new device, and no graph captured
+            # against the old one is replayable either.
+            self._routing_cache.clear()
+        self._routing_device = device
+
+        groups = self._routing_cache.get(plan)
+        if groups is None:
+            rows_by_adapter: dict[str, list[int]] = {}
+            for i, adapter_id in enumerate(plan):
+                if adapter_id is not None:
+                    rows_by_adapter.setdefault(adapter_id, []).append(i)
+            # Insertion order = first appearance of each adapter in the plan,
+            # which is the order _apply_per_row accumulated deltas in before
+            # this cache existed. Keep it: it fixes the float summation order.
+            groups = [
+                (adapter_id, torch.tensor(rows, dtype=torch.long, device=device))
+                for adapter_id, rows in rows_by_adapter.items()
+            ]
+            self._routing_cache[plan] = groups
+            while len(self._routing_cache) > _ROUTING_CACHE_MAX:
+                self._routing_cache.popitem(last=False)   # drop least-recently-used
+        else:
+            self._routing_cache.move_to_end(plan)
+        self._routing_plan = plan
+        self._routing_groups = groups
 
     # ---- forward ------------------------------------------------------------
 
@@ -248,15 +342,20 @@ class LoRALinear(nn.Module):
             raise ValueError(
                 f"per-row adapter list length {len(active)} != batch size {B}"
             )
+        plan = tuple(active)
+        if plan != self._routing_plan or self._routing_device != base_out.device:
+            # The plan reached forward without going through set_active -- a
+            # list mutated in place, or a module moved after routing. Preparing
+            # it here is correct but ALLOCATES, and allocating an index tensor
+            # from host data is what CUDA graph capture rejects. Anything that
+            # intends to be captured must route via set_active first; this is
+            # the eager-correctness fallback, not the supported capture path.
+            self._prepare_row_routing(plan, base_out.device)
         out = base_out
-        # Group row indices by adapter id (skip None -> base-only rows).
-        groups: dict[str, list[int]] = {}
-        for i, aid in enumerate(active):
-            if aid is not None:
-                groups.setdefault(aid, []).append(i)
-        for aid, rows in groups.items():
-            idx = torch.tensor(rows, dtype=torch.long, device=out.device)
-            delta = self._delta(x.index_select(0, idx), aid)
+        # Rows grouped by adapter id (None -> base-only rows, no group), with
+        # the index tensors already resident on `base_out.device`.
+        for adapter_id, idx in self._routing_groups:
+            delta = self._delta(x.index_select(0, idx), adapter_id)
             if delta is not None:
                 # Out-of-place index_add so we never alias base_out's storage.
                 out = out.index_add(0, idx, delta)

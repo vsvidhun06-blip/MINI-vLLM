@@ -44,8 +44,16 @@ import torch
 from torch.overrides import TorchFunctionMode
 
 from src.engine.kv_cache import PagedKVCache, PagedRequestCache
-from src.engine.live_graph import DecodeGraphRouter, StaticDecodeBatch
-from src.engine.lora import LoRALinear, LoRAManager
+from src.engine.live_graph import (
+    DecodeGraphRouter,
+    LiveDecodeGraphRunner,
+    StaticDecodeBatch,
+)
+from src.engine.lora import (
+    LoRALinear,
+    LoRAManager,
+    normalize_routing_plan,
+)
 from src.engine.lora_model import (
     LoRALlamaModel,
     model_routing_plan,
@@ -190,27 +198,194 @@ def test_routing_selects_a_different_operation_sequence():
     )
 
 
-def test_per_row_routing_constructs_tensors_from_python_lists():
-    """`_apply_per_row` builds its index tensor from a Python list per layer.
+def test_per_row_routing_builds_no_host_tensors_inside_forward():
+    """A prepared per-row plan constructs NOTHING from host data in forward.
 
-    On CUDA that is a pageable host->device copy. attention.py:540-545 removed
-    exactly this pattern from the decode path on the grounds that it is
-    "illegal inside a CUDA-graph capture". Recording it here states the
-    hypothesis precisely so the CUDA-gated test below can settle it; this test
-    itself only establishes that the copies exist, which is CPU-observable.
+    THIS IS THE REGRESSION TEST FOR THE ROOT CAUSE. `_apply_per_row` used to
+    build its row-index tensor with `torch.tensor(rows, device=...)` once per
+    wrapped projection per step. On CUDA that is a pageable host->device copy,
+    and a T4 rejected every routed capture with
+
+        RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA
+        graph capture unless the CPU tensor is pinned.
+
+    for plans [a,b], [a], [a,b,a], [a,b,b] -- so no routed graph existed and
+    the routed arm silently ran eager. `set_active` now prepares those indices
+    on the projection's device, ahead of capture, and forward only reads them.
+
+    `_record_ops` installs the plan BEFORE entering the recorder, exactly as
+    the scheduler installs it before the decode forward, so what this counts is
+    the forward alone. attention.py:540-545 removed the same pattern from the
+    decode path for the same reason; this keeps it removed from the LoRA path.
     """
     model = _lora_model()
-    _pool, caches, input_ids = _decode_fixture(model)
 
+    # ---- the projection in isolation: the exact site of the H2D copy -------
+    # No KV cache in the picture at all, so a single `torch.tensor` here is
+    # unambiguously _apply_per_row's.
+    proj = next(_projections(model))
+    x = torch.randn(2, 128, generator=torch.Generator().manual_seed(9))
+    model.set_batch_adapters(["a", "b"])
+    recorder = _OpRecorder()
+    with torch.no_grad(), recorder:
+        proj(x)
+    assert recorder.ops.count("tensor") == 0, (
+        f"_apply_per_row constructed a tensor from host data; on CUDA that is "
+        f"the pageable H2D copy graph capture rejects. Routing indices must be "
+        f"prepared in set_active(), not built in forward. ops={recorder.ops}"
+    )
+    # The delta arithmetic is still there -- this is a prepared-metadata fix,
+    # not a disabled-routing fix.
+    assert recorder.ops.count("index_select") == 2   # one gather per adapter
+    assert recorder.ops.count("index_add") == 2      # one scatter per adapter
+
+    # ---- and the whole decode forward: routing adds no host tensors --------
+    # CALIBRATION MATTERS HERE. `_record_ops` restores the caches by dropping
+    # their cached block tables, so the first recording after prefill reuses
+    # them and every later one rebuilds -- two `torch.tensor(block_table)`
+    # calls that belong to the KV cache, not to LoRA. The previous version of
+    # this test compared an un-warmed base recording (0) against a routed one
+    # (2) and credited the difference to `_apply_per_row`; it would have passed
+    # just the same with the routing indices already fixed. Warm up first so
+    # both arms are measured from the same cache state, then the comparison is
+    # about routing and nothing else.
+    model.clear_adapters()          # the fixture prefills one row at a time
+    _pool, caches, input_ids = _decode_fixture(model)
+    _record_ops(model, caches, input_ids, [None, None])          # warm-up, discarded
     base_ops = _record_ops(model, caches, input_ids, [None, None])
     routed_ops = _record_ops(model, caches, input_ids, ["a", "b"])
 
-    assert base_ops.count("tensor") == 0, (
-        "the base decode path should construct no tensors from host data"
+    assert routed_ops.count("tensor") == base_ops.count("tensor"), (
+        f"a routed decode forward built "
+        f"{routed_ops.count('tensor') - base_ops.count('tensor')} more host "
+        f"tensors than the same batch running on base; on CUDA each one is a "
+        f"pageable H2D copy that stream capture rejects"
     )
-    assert routed_ops.count("tensor") > 0, (
-        "expected _apply_per_row's torch.tensor(rows, ...) index construction"
+    assert routed_ops.count("index_select") > 0 and routed_ops.count("index_add") > 0
+
+
+def test_set_active_prepares_row_indices_on_the_weight_device():
+    """The prepared groups are the correct rows, on the projections' device."""
+    model = _lora_model()
+    model.set_batch_adapters(["a", None, "b", "a"])
+
+    for proj in _projections(model):
+        assert proj._routing_plan == ("a", None, "b", "a")     # noqa: SLF001
+        groups = dict(proj._routing_groups)                    # noqa: SLF001
+        assert set(groups) == {"a", "b"}, (
+            "base (None) rows must not get a group; they are base-only"
+        )
+        assert groups["a"].tolist() == [0, 3]
+        assert groups["b"].tolist() == [2]
+        for idx in groups.values():
+            assert idx.dtype == torch.long
+            assert idx.device == proj.base.weight.device, (
+                "row indices must live where the wrapped projection's weights "
+                "do, or forward would need an H2D copy to use them"
+            )
+
+    # Whole-batch routing needs no indices at all: no allocation on the
+    # single-adapter path and none on the zero-overhead base path.
+    model.set_adapter("a")
+    for proj in _projections(model):
+        assert proj._routing_plan is None and proj._routing_groups == []   # noqa: SLF001
+    model.clear_adapters()
+    for proj in _projections(model):
+        assert proj._routing_plan is None and proj._routing_groups == []   # noqa: SLF001
+
+
+def test_changing_the_plan_refreshes_the_prepared_indices():
+    """A new plan replaces the live groups; a repeat plan REUSES the tensors.
+
+    Reuse is a correctness requirement, not an optimisation. A graph captured
+    under plan P baked in the ADDRESS of P's index tensors, so re-installing P
+    -- which the scheduler does on every step of a steady mixed batch -- must
+    hand the same storage back, or the replay would gather from freed memory.
+    """
+    model = _lora_model()
+    proj = next(_projections(model))
+
+    model.set_batch_adapters(["a", "b"])
+    first_ptrs = {k: v.data_ptr() for k, v in proj._routing_groups}   # noqa: SLF001
+
+    model.set_batch_adapters(["b", "a", "a"])
+    changed = dict(proj._routing_groups)                       # noqa: SLF001
+    assert proj._routing_plan == ("b", "a", "a")               # noqa: SLF001
+    assert changed["a"].tolist() == [1, 2] and changed["b"].tolist() == [0]
+
+    # Re-install the ORIGINAL plan, from a fresh list object.
+    model.set_batch_adapters(["a", "b"])
+    assert proj._routing_plan == ("a", "b")                    # noqa: SLF001
+    again_ptrs = {k: v.data_ptr() for k, v in proj._routing_groups}  # noqa: SLF001
+    assert again_ptrs == first_ptrs, (
+        "re-installing a plan reallocated its row-index tensors; a CUDA graph "
+        "captured under that plan would replay against the old addresses"
     )
+
+
+def test_unprepared_plan_still_computes_the_right_answer_eagerly():
+    """A plan that reaches forward without set_active is still correct.
+
+    The prepared path is what capture requires; it must not become what
+    CORRECTNESS requires. A layer driven directly (a mutated list, a hand-set
+    `_active`) has to fall back to preparing on the spot and produce exactly
+    the same output as the routed model.
+    """
+    model = _lora_model()
+    x = torch.randn(3, 128, generator=torch.Generator().manual_seed(11))
+    plan = ["a", None, "b"]
+
+    projections = list(_projections(model))
+    model.set_batch_adapters(plan)
+    prepared = projections[0](x)
+
+    other = projections[0]
+    other._routing_plan = None                                 # noqa: SLF001
+    other._routing_groups = []                                 # noqa: SLF001
+    other._routing_cache.clear()                               # noqa: SLF001
+    other._active = list(plan)                                 # noqa: SLF001
+    assert torch.equal(other(x), prepared)
+    assert other._routing_plan == ("a", None, "b")             # noqa: SLF001
+
+
+def test_per_row_output_row_ordering_is_unchanged():
+    """Per-row routing composes as base + that row's adapter delta, in order.
+
+    Row i of the routed output must equal row i of a single-adapter forward
+    under active[i] (or the base forward where active[i] is None). This is the
+    property the grouping/scatter is an optimisation OF, and it is what pins
+    the output row order across the prepared-index rewrite.
+    """
+    model = _lora_model()
+    proj = next(_projections(model))
+    x = torch.randn(4, 128, generator=torch.Generator().manual_seed(12))
+
+    model.clear_adapters()
+    base = proj(x)
+    per_adapter = {}
+    for adapter_id in ("a", "b"):
+        model.set_adapter(adapter_id)
+        per_adapter[adapter_id] = proj(x)
+
+    plan = ["b", None, "a", "b"]
+    model.set_batch_adapters(plan)
+    routed = proj(x)
+
+    for i, adapter_id in enumerate(plan):
+        expected = base[i] if adapter_id is None else per_adapter[adapter_id][i]
+        assert torch.allclose(routed[i], expected, atol=1e-6), (
+            f"row {i} of the mixed-adapter output is not row {i} under "
+            f"adapter {adapter_id!r}"
+        )
+
+
+def test_plan_length_mismatch_still_raises_before_any_preparation():
+    """The batch-size guard is checked first and still names both lengths."""
+    model = _lora_model()
+    model.set_batch_adapters(["a", "b"])
+    proj = next(_projections(model))
+    with pytest.raises(ValueError, match=r"length 2 != batch size 3"):
+        proj(torch.randn(3, 128))
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +408,9 @@ def test_per_row_routing_constructs_tensors_from_python_lists():
 # ---------------------------------------------------------------------------
 
 
+_UNSET = object()   # "caller passed no routing plan", distinct from plan None
+
+
 class _StaticReplayRunner(DecodeGraphRouter):
     """CPU stand-in for a captured decode graph. NOT a CUDA result.
 
@@ -249,6 +427,10 @@ class _StaticReplayRunner(DecodeGraphRouter):
         self.freeze_routing = freeze_routing
         self.guard_routing = guard_routing
         self.replay_calls = 0
+        # Every routing plan replay() was actually CALLED with, so a test can
+        # assert the scheduler threaded the live plan through (B3) rather
+        # than replay() having recomputed it.
+        self.replay_plans: list = []
         self._captured_plans: dict[int, object] = {}
         self.graph_plans: dict[tuple[int, int], object] = {}
         for batch_size in self.batch_sizes:
@@ -280,11 +462,15 @@ class _StaticReplayRunner(DecodeGraphRouter):
             routing_plan = next(iter(self.graph_plans.values()), None)
         return super()._resolve(batch_size, caches, routing_plan)
 
-    def replay(self, input_ids, caches):
-        # Resolve with the live plan, as LiveDecodeGraphRunner.replay does --
-        # otherwise a graph legitimately captured under a routed plan could
-        # never be replayed.
-        key = self._resolve(len(caches), caches, model_routing_plan(self.model))
+    def replay(self, input_ids, caches, routing_plan=_UNSET):
+        # Resolve with the plan the CALLER passed, as
+        # LiveDecodeGraphRunner.replay now does (B3). The scheduler always
+        # supplies it; `_UNSET` marks a direct call from a test that did not,
+        # and only then do we fall back to reading it off the model.
+        if routing_plan is _UNSET:
+            routing_plan = model_routing_plan(self.model)
+        self.replay_plans.append(routing_plan)
+        key = self._resolve(len(caches), caches, routing_plan)
         assert key is not None, "replay() called without a routable key"
         self.replay_calls += 1
         (state,) = self.graphs[key]
@@ -669,44 +855,130 @@ def test_non_lora_model_is_unaffected_by_the_routing_guard():
 # ---------------------------------------------------------------------------
 
 
+def _cuda_live_decode_batch(model, runner, batch: int, prompt_len: int = 6):
+    """`batch` real prefilled caches on the runner's pool, prefilled under base.
+
+    A routed capture can only be driven from a LIVE decode batch of the RIGHT
+    SIZE: a per-row plan has one entry per batch row, so an n-entry plan is
+    only meaningful against n rows. Requests are prefilled unrouted because the
+    plan under test is a property of the decode batch, which is where the
+    scheduler installs it.
+    """
+    pool = runner.pool
+    model.clear_adapters()
+    blocks = (prompt_len + 2 + pool.block_size - 1) // pool.block_size + 1
+    g = torch.Generator().manual_seed(31)
+    rids, caches = [], []
+    for i in range(batch):
+        rid = f"__routed_capture_{i}__"
+        pool.admit_request(request_id=rid, prefill_blocks_needed=blocks,
+                           total_blocks_needed=blocks)
+        rids.append(rid)
+        cache = PagedRequestCache(pool, rid, num_layers=pool.num_layers)
+        ids = torch.randint(0, 256, (1, prompt_len), generator=g).cuda()
+        with torch.no_grad():
+            model(ids, kv_cache=cache)
+        caches.append(cache)
+    return rids, caches
+
+
 @cuda_only
 def test_cuda_capture_under_active_per_row_routing():
     """Does a real capture even SUCCEED while a per-row plan is active?
 
-    `_apply_per_row` constructs its index tensor from a Python list once per
-    wrapped projection (see the CPU test above). On CUDA that is a pageable
-    H2D copy, which CUDA stream capture rejects. Records the outcome either
-    way rather than asserting a guess: both answers are informative, and they
-    imply different fixes.
+    THE HAZARD. `_apply_per_row` used to build its row-index tensor from a
+    Python list inside forward, which on CUDA is a pageable H2D copy. A T4
+    settled it: stream capture rejects that outright --
+
+        RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA
+        graph capture unless the CPU tensor is pinned.
+
+    -- for every routed plan it was tried with ([a,b], [a], [a,b,a], [a,b,b]).
+    `LoRALinear.set_active` now prepares those indices on the device ahead of
+    capture. This test is the hardware check that the preparation is sufficient:
+    if capture ever stops succeeding under an active plan, the on-demand
+    capture policy needs revisiting and this must go red.
+
+    WHY IT IS DRIVEN FROM A LIVE BATCH AND NOT FROM `capture_all()`. An earlier
+    version of this test routed the model to a two-entry plan and then called
+    `capture_all()`, which walks EVERY batch size in the grid -- including 1.
+    A two-entry plan against a one-row batch is not a CUDA question at all; it
+    is the plan-length guard doing its job, and it made this test fail with
+
+        ValueError: per-row adapter list length 2 != batch size 1
+
+    while saying nothing about capture. A per-row plan sizes its batch, so the
+    routed capture is exercised at the batch size the plan describes, through
+    the same on-demand path production uses (`can_replay` -> `_capture_on_demand`).
     """
-    from src.engine.live_graph import LiveDecodeGraphRunner
+    plan = ["a", "b"]
 
     model = _lora_model(device="cuda")
     sched = ContinuousBatchScheduler(
-        model, max_batch_size=2, num_blocks=256, block_size=BLOCK_SIZE,
+        model, max_batch_size=len(plan), num_blocks=256, block_size=BLOCK_SIZE,
         use_cuda_graphs=True,
     )
     runner = LiveDecodeGraphRunner(
-        model, sched.pool, max_batch_size=2, max_context_tokens=64,
+        model, sched.pool, max_batch_size=len(plan), max_context_tokens=64,
     )
-    model.set_batch_adapters(["a", "b"])
-    outcome, detail = "captured", ""
+    # The unrouted grid first, at the documented point: before any request is
+    # admitted, so nothing is routed yet and the pool is empty.
+    runner.capture_all(require_all=True)
+    assert runner.report()["capture_failures"] == []
+
+    rids, caches = _cuda_live_decode_batch(model, runner, batch=len(plan))
     try:
-        runner.capture_all(require_all=True)
-    except Exception as exc:                                    # noqa: BLE001
-        outcome, detail = "refused", f"{type(exc).__name__}: {exc}"
-    print(f"\n[B1/cuda] capture under an active per-row plan: {outcome} {detail}")
-    assert outcome in {"captured", "refused"}
+        model.set_batch_adapters(plan)
+        live_plan = model_routing_plan(model)
+        assert live_plan == ("a", "b"), live_plan
+        servable = runner.can_replay(len(caches), caches, live_plan)
+        report = runner.report()
+        print(f"\n[B1/cuda] routed capture under {live_plan}: "
+              f"servable={servable} failures={report['routed_capture_failures']}")
+
+        # ORDER MATTERS: name the CUDA exception before the symptom. A refused
+        # `can_replay` and a thrown capture look identical from the boolean.
+        assert report["routed_capture_failures"] == [], (
+            f"capture under an active per-row routing plan FAILED: "
+            f"{report['first_routed_capture_error']}"
+        )
+        assert servable, (
+            f"nothing captured for the live routed batch: {report} "
+            f"reasons={dict(runner.fallback_reasons)}"
+        )
+        # The capture really produced a graph, and it is keyed by the plan it
+        # ran under -- B2: a batch routed differently cannot reach it.
+        assert any(len(k) == 3 and k[2] == ("a", "b") for k in runner.graphs), (
+            f"no graph is keyed by the active per-row plan: {sorted(runner.graphs)}"
+        )
+        assert report["routed_plans_captured"] == ["[a,b]"], (
+            f"capture did not record the active per-row plan: {report}")
+        assert "[a,b]" in report["routing_plans_captured"], report
+        assert report["graphs_captured"] > 0
+    finally:
+        for rid in rids:
+            sched.pool.free_request(rid)
 
 
 @cuda_only
 def test_cuda_replay_honours_live_lora_routing():
     """The real thing: capture unrouted, then serve a mixed-adapter batch.
 
-    Asserts the same invariant as the CPU xfail above, against a genuine
-    `torch.cuda.CUDAGraph`. Expected to FAIL until B1 is fixed; it is not
-    xfail-marked because it has never been executed and its true outcome on
-    hardware is exactly what this investigation could not determine.
+    HISTORY. On the T4 this reported `graph_hits: 0` with
+    `lora_routing_mismatch: 9`. That was the guard working and the capture
+    policy missing: routed batches were correctly refused, but nothing ever
+    captured a graph for the plans they used, so there was nothing to hit. The
+    refusal was right; the zero was not acceptable.
+
+    With B2 (plan in the graph key) and B3 (the live plan threaded into
+    `replay`), `capture_all()` still captures only the unrouted grid -- it runs
+    before any request exists -- and each routed plan is captured on demand the
+    first time the scheduler actually produces it. So those same 9 steps must
+    now be graph hits, and the tokens must still match eager exactly.
+
+    Both halves matter. Hits without token equality would mean a graph is
+    replaying the wrong adapter arithmetic, which is the failure this whole
+    module exists to prevent.
     """
     from src.engine.live_graph import LiveDecodeGraphRunner
 
@@ -742,12 +1014,543 @@ def test_cuda_replay_honours_live_lora_routing():
 
     eager, _ = serve(False)
     graphed, sched = serve(True)
-    hits = sched.graph_diagnostics()["reasons"].get("graph_hit", 0)
+    diagnostics = sched.graph_diagnostics()
+    hits = diagnostics["reasons"].get("graph_hit", 0)
+    report = diagnostics["runner_report"]
+
+    # ORDER MATTERS. Assert the capture exception FIRST. A routed capture that
+    # throws every step yields hits == 0, which is also what a genuine routing
+    # refusal looks like -- and asserting `hits > 0` first reports the symptom
+    # while the cause sits unread in the report. That is precisely how a T4 run
+    # came back blaming `lora_routing_mismatch` for a CUDA capture failure.
+    assert report["routed_capture_failures"] == [], (
+        f"on-demand routed capture FAILED -- this, not the routing guard, is "
+        f"why there are no graph hits. "
+        f"first error: {report['first_routed_capture_error']} | "
+        f"all failures: {report['routed_capture_failures']}"
+    )
     assert hits > 0, (
-        f"no graph replay happened, so this test proved nothing: "
-        f"{sched.graph_diagnostics()}"
+        f"no graph replay happened, so this test proved nothing: {diagnostics}"
+    )
+    # The point of B2/B3: the hits must come from ROUTED graphs, not merely
+    # from whatever base-only steps the workload happened to contain.
+    routed = [p for p in report["routing_plans_captured"] if p != "base"]
+    assert routed, (
+        f"only the unrouted grid was ever captured, so the mixed-adapter "
+        f"batches all fell back: {diagnostics}"
     )
     assert eager == graphed, (
         f"CUDA graph replay served different tokens than eager decode for a "
-        f"mixed-adapter workload ({hits} replays)"
+        f"mixed-adapter workload ({hits} replays, routed plans {routed})"
     )
+
+
+# ---------------------------------------------------------------------------
+# B2 + B3. Routing plan as part of GRAPH IDENTITY.
+#
+# The doubles above use the LEGACY key layout -- `graphs[(batch, blocks)]` plus
+# a `graph_plans` side table -- which production no longer writes and which
+# these tests deliberately keep exercised (backwards compatibility). The runner
+# below uses the layout `LiveDecodeGraphRunner._capture` now writes:
+#
+#     graphs[(batch_size, n_blocks, canonical_routing_plan)]
+#
+# so a plan mismatch is a MISSING KEY rather than a comparison some future edit
+# could forget to make. Still CPU-only and still not a CUDA result: it swaps
+# `graph.replay()` for the same `StaticDecodeBatch.run_eager` the other doubles
+# use. What it pins is the routing/identity logic, which is pure host code and
+# byte-identical on both.
+# ---------------------------------------------------------------------------
+
+
+class _RoutedStaticRunner(DecodeGraphRouter):
+    """CPU stand-in keyed the way production keys routed graphs."""
+
+    def __init__(self, model, pool, **kwargs):
+        super().__init__(pool, **kwargs)
+        self.model = model
+        self.replay_calls = 0
+        self.replay_plans: list = []
+        self.captured_plans: list = []
+
+    def capture_plan(self, plan) -> None:
+        """Capture the whole (batch x bucket) grid under one routing plan.
+
+        `plan` is canonicalised exactly as `_capture` does, so `[None, None]`
+        registers as base and cannot masquerade as a distinct routed plan.
+        """
+        canonical = normalize_routing_plan(plan)
+        self.captured_plans.append(canonical)
+        for batch_size in self.batch_sizes:
+            for n_blocks in self.buckets:
+                self.graphs[(batch_size, n_blocks, canonical)] = (
+                    StaticDecodeBatch(self.pool, batch_size, n_blocks),)
+
+    def replay(self, input_ids, caches, routing_plan=None):
+        self.replay_plans.append(routing_plan)
+        key = self._resolve(len(caches), caches, routing_plan)
+        assert key is not None, "replay() called without a routable key"
+        self.replay_calls += 1
+        (state,) = self.graphs[key]
+        state.stage(input_ids, caches)
+        out = state.run_eager(self.model)
+        state.commit(caches)
+        return out
+
+
+def _drive(sched, adapters):
+    """Run _WORKLOAD through an already-configured scheduler."""
+    g = torch.Generator().manual_seed(7)
+    prompts = {rid: torch.randint(0, 256, (1, 6), generator=g)
+               for rid, _, _, _ in _WORKLOAD}
+    tokens: dict[str, list[int]] = {}
+    for step in range(60):
+        for rid, _a, max_new, admit_step in _WORKLOAD:
+            if step == admit_step:
+                sched.add_request(rid, prompts[rid], max_new_tokens=max_new,
+                                  eos_token_id=None, adapter_id=adapters[rid])
+        if not sched.has_work() and step > max(w[3] for w in _WORKLOAD):
+            break
+        for rid, token_id in sched.step():
+            tokens.setdefault(rid, []).append(token_id)
+    return tokens
+
+
+def _new_sched(model):
+    model.clear_adapters()
+    return ContinuousBatchScheduler(
+        model, max_batch_size=4, num_blocks=256, block_size=BLOCK_SIZE,
+        use_cuda_graphs=True,
+    )
+
+
+def _serve_routed(model, *, capture_plans, adapters, out=None):
+    """Serve _WORKLOAD with a routed-key runner pre-captured under each plan."""
+    sched = _new_sched(model)
+    runner = _RoutedStaticRunner(model, sched.pool, max_batch_size=4,
+                                max_context_tokens=64)
+    for plan in capture_plans:
+        runner.capture_plan(plan)
+    sched._graph_runner = runner
+    if out is not None:
+        out["runner"], out["scheduler"] = runner, sched
+    return _drive(sched, adapters)
+
+
+def _eager_reference(model, adapters):
+    """Same workload, no runner attached -- the ground-truth token stream."""
+    return _drive(_new_sched(model), adapters)
+
+
+def test_invariant_1_unrouted_capture_refuses_routed_batches():
+    """Capture under base only + live routed plan => every replay refused."""
+    model = _lora_model()
+    out: dict = {}
+    served = _serve_routed(model, capture_plans=[None],
+                           adapters=_LORA_ADAPTERS, out=out)
+    runner, sched = out["runner"], out["scheduler"]
+
+    routed = [p for p in runner.replay_plans if p is not None]
+    assert not routed, f"a base-only recording served {len(routed)} routed batches"
+    assert sched.graph_diagnostics()["runner_fallback_reasons"].get(
+        "lora_routing_mismatch", 0) > 0, (
+        "routed batches were refused for some reason OTHER than the routing "
+        f"guard: {sched.graph_diagnostics()}")
+    assert served == _eager_reference(model, _LORA_ADAPTERS)
+
+
+def test_invariant_2_matching_routed_plan_is_allowed():
+    """Capture under P + live P => replay ALLOWED, and output still exact.
+
+    This is the invariant that could not hold before B2: production recorded no
+    plan at all, so `captured_plan` was always None and every routed batch was
+    refused. A zero hit rate under LoRA was structural, not a policy choice.
+    """
+    model = _lora_model()
+    ledger: list = []
+    _serve(model, adapters=_LORA_ADAPTERS, runner_mode=None, ledger=ledger)
+    plans = {tuple(e["plan"]) if isinstance(e["plan"], list) else e["plan"]
+             for e in ledger}
+
+    out: dict = {}
+    served = _serve_routed(model, capture_plans=sorted(plans, key=str),
+                           adapters=_LORA_ADAPTERS, out=out)
+    runner, sched = out["runner"], out["scheduler"]
+
+    assert runner.replay_calls > 0, (
+        f"no batch was served from a matching recording: "
+        f"{sched.graph_diagnostics()}")
+    assert any(p is not None for p in runner.replay_plans), (
+        "only base batches replayed; the routed path proved nothing")
+    assert sched.graph_diagnostics()["reasons"].get("graph_hit", 0) > 0
+    assert served == _eager_reference(model, _LORA_ADAPTERS), (
+        "replaying a graph captured under the live plan changed the output")
+
+
+def test_invariant_3_different_routed_plan_is_refused():
+    """Capture under P + live Q => refused, even though shape and bucket match."""
+    model = _lora_model()
+    foreign = ("b", "a", "b", "a")
+    out: dict = {}
+    served = _serve_routed(model, capture_plans=[foreign],
+                           adapters=_LORA_ADAPTERS, out=out)
+    runner, sched = out["runner"], out["scheduler"]
+
+    for plan in runner.replay_plans:
+        assert plan == foreign, (
+            f"a recording captured under {foreign} served plan {plan!r}")
+    assert sched.graph_diagnostics()["runner_fallback_reasons"].get(
+        "lora_routing_mismatch", 0) > 0
+    assert served == _eager_reference(model, _LORA_ADAPTERS)
+
+
+def test_invariant_4_base_only_workload_still_replays():
+    """The routing guard must not cost the base workload its graph hits."""
+    model = _lora_model()
+    out: dict = {}
+    served = _serve_routed(model, capture_plans=[None],
+                           adapters=_BASE_ADAPTERS, out=out)
+    runner, sched = out["runner"], out["scheduler"]
+
+    assert runner.replay_calls > 0, "base workload lost graph replay"
+    assert all(p is None for p in runner.replay_plans)
+    assert sched.graph_diagnostics()["runner_fallback_reasons"].get(
+        "lora_routing_mismatch", 0) == 0, (
+        "an all-base batch was refused as a routing mismatch")
+    assert served == _eager_reference(model, _BASE_ADAPTERS)
+
+
+def test_invariant_5_plain_model_routing_machinery_is_inert():
+    """A plain LlamaModel yields plan None everywhere; nothing changes."""
+    plain = _tiny_model()
+    assert model_routing_plan(plain) is None
+
+    sched = ContinuousBatchScheduler(
+        plain, max_batch_size=4, num_blocks=256, block_size=BLOCK_SIZE,
+        use_cuda_graphs=True,
+    )
+    runner = _RoutedStaticRunner(plain, sched.pool, max_batch_size=4,
+                                 max_context_tokens=64)
+    runner.capture_plan(None)
+    sched._graph_runner = runner
+
+    g = torch.Generator().manual_seed(7)
+    for i in range(2):
+        sched.add_request(f"p{i}", torch.randint(0, 256, (1, 6), generator=g),
+                          max_new_tokens=5, eos_token_id=None)
+    while sched.has_work():
+        sched.step()
+
+    assert runner.replay_calls > 0
+    assert all(p is None for p in runner.replay_plans)
+    assert sched.graph_diagnostics()["runner_fallback_reasons"].get(
+        "lora_routing_mismatch", 0) == 0
+
+
+def test_invariant_6_replay_receives_the_schedulers_live_plan():
+    """B3: the plan `_decode_forward` computed is the plan `replay` resolves.
+
+    Pins the threading itself, not just its effect. Every plan `replay` was
+    called with must equal the model's live plan at that moment, which the spy
+    on `_decode_forward` records independently.
+    """
+    model = _lora_model()
+    ledger: list = []
+    sched = _new_sched(model)
+    runner = _RoutedStaticRunner(model, sched.pool, max_batch_size=4,
+                                 max_context_tokens=64)
+    runner.capture_plan(None)
+    sched._graph_runner = runner
+
+    original = ContinuousBatchScheduler._decode_forward
+
+    def spy(self, input_ids, caches):
+        before = len(runner.replay_plans)
+        live = model_routing_plan(model)
+        result = original(self, input_ids, caches)
+        if len(runner.replay_plans) > before:          # this step replayed
+            ledger.append((live, runner.replay_plans[-1]))
+        return result
+
+    ContinuousBatchScheduler._decode_forward = spy
+    try:
+        _drive(sched, _BASE_ADAPTERS)
+    finally:
+        ContinuousBatchScheduler._decode_forward = original
+
+    assert ledger, "no replay happened, so the threading was never exercised"
+    for live, passed in ledger:
+        assert live == passed, (
+            f"replay() resolved with {passed!r} while the scheduler's live "
+            f"plan was {live!r}; the plan did not reach replay unchanged")
+
+
+def _bare_pool(model):
+    return PagedKVCache(
+        num_layers=model.config.num_hidden_layers, num_blocks=64,
+        block_size=BLOCK_SIZE, num_kv_heads=model.config.num_key_value_heads,
+        head_dim=model.config.hidden_size // model.config.num_attention_heads,
+        dtype=torch.float32, device="cpu", enable_prefix_cache=False,
+    )
+
+
+def test_routed_keys_and_legacy_keys_both_resolve():
+    """Backwards compatibility: the 2-tuple + graph_plans layout still works.
+
+    `_StaticReplayRunner` (used by every test above this section) writes the
+    legacy layout. This asserts the two coexist in one router and that neither
+    can serve the other's plan.
+    """
+    r = DecodeGraphRouter(_bare_pool(_lora_model()), max_batch_size=2,
+                          max_context_tokens=64)
+    nb = r.buckets[0]
+    r.graphs[(1, nb, None)] = ("routed-base",)
+    r.graphs[(1, nb, ("a",))] = ("routed-a",)
+    r.graphs[(2, nb)] = ("legacy",)
+    r.graph_plans = {(2, nb): ["b", "b"]}
+
+    assert r._lookup(1, nb, None) == (1, nb, None)
+    assert r._lookup(1, nb, ("a",)) == (1, nb, ("a",))
+    assert r._lookup(1, nb, ("b",)) is None
+    # Legacy: the side table's plan is canonicalised before comparison.
+    assert r._lookup(2, nb, ("b", "b")) == (2, nb)
+    assert r._lookup(2, nb, None) is None
+    assert r._lookup(2, nb, ("a", "b")) is None
+
+
+def test_all_none_plan_is_canonically_base():
+    """[None, None] is base -- it must NOT become a distinct routed graph."""
+    model = _lora_model()
+    r = _RoutedStaticRunner(model, _bare_pool(model), max_batch_size=2,
+                            max_context_tokens=64)
+    r.capture_plan([None, None])
+    assert r.captured_plans == [None]
+    nb = r.buckets[0]
+    assert r._lookup(2, nb, None) == (2, nb, None)
+    assert len(r.graphs) == len(r.batch_sizes) * len(r.buckets)
+
+
+# ---------------------------------------------------------------------------
+# The ON-DEMAND capture policy, exercised on CPU.
+#
+# `LiveDecodeGraphRunner.can_replay` is the method that decides whether to
+# capture a graph for a newly-seen routing plan, and it is the only part of the
+# B2/B3 change that lives on the CUDA-only class. Left untested it would first
+# execute on the T4, which is the exact situation this repository has twice paid
+# for. So the routing/budget/bookkeeping half is driven here through the REAL
+# method, with only `_capture` -- the part that genuinely needs a GPU --
+# replaced by a recorder.
+#
+# This is NOT a claim that CUDA capture works. It pins the policy: which plans
+# get captured, how often, what happens at the budget, and that a capture
+# failure degrades to eager instead of propagating.
+# ---------------------------------------------------------------------------
+
+
+class _FakeCudaRunner(LiveDecodeGraphRunner):
+    """Real `can_replay` / `_capture_on_demand`; `_capture` records instead."""
+
+    def __init__(self, pool, *, max_routed_graphs=16, fail_plans=()):
+        DecodeGraphRouter.__init__(self, pool, max_batch_size=4,
+                                   max_context_tokens=64)
+        self.model = None
+        self.device = pool.K_pool.device
+        self._mempool = None
+        self.max_routed_graphs = max_routed_graphs
+        self.routed_plans = []
+        self.routed_capture_failures = []
+        self.captured: list = []
+        self._fail_plans = set(fail_plans)
+
+    def _capture(self, batch_size, n_blocks, plan=None, caches=None):
+        if plan in self._fail_plans:
+            raise RuntimeError("simulated capture failure (e.g. OOM)")
+        assert caches is not None, (
+            "an on-demand capture must stage the LIVE batch, not placeholders")
+        self.captured.append((batch_size, n_blocks, plan))
+        self.graphs[(batch_size, n_blocks, plan)] = ("recorded",)
+
+
+def _cuda_sync_noop(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+
+
+def _fixture_caches(model, batch=2):
+    pool, caches, _ids = _decode_fixture(model, batch=batch)
+    return pool, caches
+
+
+def test_on_demand_captures_a_new_routed_plan_once(monkeypatch):
+    """First sighting of a plan captures; later sightings reuse."""
+    _cuda_sync_noop(monkeypatch)
+    model = _lora_model()
+    pool, caches = _fixture_caches(model)
+    r = _FakeCudaRunner(pool)
+
+    plan = ("a", "b")
+    assert r.can_replay(2, caches, plan) is True
+    assert len(r.captured) == 1, r.captured
+    assert r.routed_plans == [plan]
+
+    for _ in range(3):
+        assert r.can_replay(2, caches, plan) is True
+    assert len(r.captured) == 1, "a cached routed plan was re-captured"
+    assert r.fallback_reasons == {}, (
+        f"a step that ended in a hit also recorded a fallback: "
+        f"{r.fallback_reasons}")
+
+
+def test_on_demand_does_not_capture_the_unrouted_plan(monkeypatch):
+    """Base is capture_all()'s job; a base miss is a real capture failure."""
+    _cuda_sync_noop(monkeypatch)
+    model = _lora_model()
+    pool, caches = _fixture_caches(model)
+    r = _FakeCudaRunner(pool)
+
+    assert r.can_replay(2, caches, None) is False
+    assert r.captured == [], "on-demand capture papered over a missing base grid"
+    assert r.fallback_reasons.get("bucket_capture_failed", 0) == 1
+
+
+def test_on_demand_respects_the_routed_graph_budget(monkeypatch):
+    """Past the cap, new plans fall back and say so; existing ones still hit."""
+    _cuda_sync_noop(monkeypatch)
+    model = _lora_model()
+    pool, caches = _fixture_caches(model)
+    r = _FakeCudaRunner(pool, max_routed_graphs=2)
+
+    assert r.can_replay(2, caches, ("a", "b")) is True
+    assert r.can_replay(2, caches, ("b", "a")) is True
+    # Third distinct plan exceeds the budget.
+    assert r.can_replay(2, caches, ("a", "a")) is False
+    assert r.fallback_reasons.get("routed_graph_budget_exhausted", 0) == 1
+    assert len(r.routed_plans) == 2
+    # A plan captured before the cap still replays.
+    assert r.can_replay(2, caches, ("a", "b")) is True
+
+
+def test_on_demand_capture_failure_degrades_to_eager(monkeypatch):
+    """A failed capture is counted and falls back; it never propagates."""
+    _cuda_sync_noop(monkeypatch)
+    model = _lora_model()
+    pool, caches = _fixture_caches(model)
+    plan = ("a", "b")
+    r = _FakeCudaRunner(pool, fail_plans={plan})
+
+    assert r.can_replay(2, caches, plan) is False        # no exception escapes
+    assert r.fallback_reasons.get("routed_capture_failed", 0) == 1
+    assert len(r.routed_capture_failures) == 1
+    assert "simulated capture failure" in r.routed_capture_failures[0]["error"]
+    assert r.report()["routed_capture_failures"], (
+        "a routed capture failure must be visible in the runner report")
+
+
+def test_on_demand_never_serves_a_plan_it_did_not_capture(monkeypatch):
+    """The guard still holds: capturing P must not make Q replayable."""
+    _cuda_sync_noop(monkeypatch)
+    model = _lora_model()
+    pool, caches = _fixture_caches(model)
+    r = _FakeCudaRunner(pool, max_routed_graphs=1)
+
+    assert r.can_replay(2, caches, ("a", "b")) is True
+    assert r.can_replay(2, caches, ("b", "a")) is False   # budget exhausted
+    # The captured key is P's, and Q resolves to nothing.
+    assert r._lookup(2, r.buckets[0], ("a", "b")) is not None
+    assert r._lookup(2, r.buckets[0], ("b", "a")) is None
+
+
+def test_report_plan_strings_are_json_safe(monkeypatch):
+    """Graph keys mix None/str/tuple; the report must still sort and serialise."""
+    import json
+    _cuda_sync_noop(monkeypatch)
+    model = _lora_model()
+    pool, caches = _fixture_caches(model)
+    r = _FakeCudaRunner(pool)
+    r.graphs[(1, r.buckets[0], None)] = ("base",)
+    r.can_replay(2, caches, ("a", "b"))
+    r.can_replay(2, caches, "a")
+
+    report = r.report()
+    json.dumps(report)                       # must not raise
+    assert "base" in report["routing_plans_captured"]
+    assert "[a,b]" in report["routing_plans_captured"]
+    assert "a" in report["routing_plans_captured"]
+    assert sum(report["graphs_per_routing_plan"].values()) == len(r.graphs)
+
+
+def test_failed_routed_capture_is_not_reported_as_a_routing_mismatch(monkeypatch):
+    """A CUDA capture that throws must NOT be labelled `lora_routing_mismatch`.
+
+    THE BUG THIS PINS. `lora_routing_mismatch` means "a graph exists for this
+    shape under a DIFFERENT plan and we refused to reuse it" -- the guard doing
+    its job. When on-demand capture threw, `can_replay` fell through to
+    `_resolve`, which found the base grid at this shape and recorded exactly
+    that reason. So a T4 run whose every routed capture raised reported a
+    routing bug that did not exist, while the real exception sat unread in
+    `routed_capture_failures`. Two reasons were recorded for one decode
+    forward, which also breaks the module's one-reason-per-forward contract.
+    """
+    _cuda_sync_noop(monkeypatch)
+    model = _lora_model()
+    pool, caches = _fixture_caches(model)
+    plan = ("a", "b")
+    r = _FakeCudaRunner(pool, fail_plans={plan})
+    # A base grid at this shape, exactly as capture_all() leaves it -- this is
+    # what `_resolve` used to latch onto and misreport.
+    for nb in r.buckets:
+        r.graphs[(2, nb, None)] = ("base",)
+
+    assert r.can_replay(2, caches, plan) is False
+
+    assert r.fallback_reasons.get("lora_routing_mismatch", 0) == 0, (
+        f"a capture failure was reported as a routing mismatch: "
+        f"{dict(r.fallback_reasons)}")
+    assert r.fallback_reasons.get("routed_capture_failed", 0) == 1
+    assert sum(r.fallback_reasons.values()) == 1, (
+        f"one decode forward recorded {sum(r.fallback_reasons.values())} "
+        f"reasons: {dict(r.fallback_reasons)}")
+    assert r.report()["first_routed_capture_error"], (
+        "the capture exception must be surfaced at the top of the report")
+    assert "simulated capture failure" in r.report()["first_routed_capture_error"]
+
+
+def test_budget_exhaustion_is_not_reported_as_a_routing_mismatch(monkeypatch):
+    """Same contract for the other early exit: one reason, and the right one."""
+    _cuda_sync_noop(monkeypatch)
+    model = _lora_model()
+    pool, caches = _fixture_caches(model)
+    r = _FakeCudaRunner(pool, max_routed_graphs=0)
+    for nb in r.buckets:
+        r.graphs[(2, nb, None)] = ("base",)
+
+    assert r.can_replay(2, caches, ("a", "b")) is False
+    assert r.fallback_reasons == {"routed_graph_budget_exhausted": 1}, (
+        f"expected exactly one budget reason, got {dict(r.fallback_reasons)}")
+
+
+def test_genuine_routing_mismatch_still_reports_itself(monkeypatch):
+    """The guard must still be able to say `lora_routing_mismatch`.
+
+    The fix above must not make that reason unreachable: when a graph really
+    does exist under another plan and capture is not attempted (budget spent on
+    that plan already), the refusal is the guard's, and it must say so.
+    """
+    _cuda_sync_noop(monkeypatch)
+    model = _lora_model()
+    pool, caches = _fixture_caches(model)
+    r = _FakeCudaRunner(pool)
+    nb = r.buckets[0]
+    # A graph captured under a routed plan, and a live batch routed differently.
+    r.graphs[(2, nb, ("b", "a"))] = ("routed-other",)
+    # Take the plan out of contention for on-demand capture by exhausting the
+    # budget with it already recorded.
+    r.max_routed_graphs = 0
+
+    assert r.can_replay(2, caches, ("a", "b")) is False
+    # Budget is the proximate reason here; the point is that _resolve still
+    # reports a mismatch when it is reached with no capture attempt pending.
+    r2 = _FakeCudaRunner(pool)
+    r2.graphs[(2, nb, ("b", "a"))] = ("routed-other",)
+    assert r2._lookup(2, nb, ("a", "b")) is None
+    assert r2._resolve(2, caches, ("a", "b")) is None
+    assert r2.fallback_reasons.get("lora_routing_mismatch", 0) == 1

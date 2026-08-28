@@ -564,6 +564,19 @@ class MultiHeadAttention(nn.Module):
             q = q * cos_b + _rotate_half(q) * sin_b
             k = k * cos_b + _rotate_half(k) * sin_b
 
+        # 3b) Optional per-row ADDITIVE attention bias.
+        #
+        # An ordinary PagedRequestCache has no `decode_attn_bias`, so this is
+        # None for every row and the loop below is byte-identical to the
+        # pre-existing eager path. It is non-None only for the static-shape
+        # caches in src/engine/live_graph.py, whose `get()` returns the whole
+        # PADDED block table (a constant shape, which is what makes the decode
+        # forward CUDA-graph-capturable) instead of trimming to seq_len. The
+        # bias is what suppresses that padding: 0.0 for positions the request
+        # actually holds, -inf beyond. Masked columns contribute exp(-inf-m)==0
+        # exactly, so the result is identical to the trimmed gather.
+        biases = [getattr(c, "decode_attn_bias", None) for c in caches]
+
         # 4) Per-request cache update + SDPA. This is the loop we cannot
         #    avoid without padding (or paged attention -- Day 7). The body
         #    is the same per-request work the single-cache path does.
@@ -586,11 +599,17 @@ class MultiHeadAttention(nn.Module):
             q_i = q[i:i+1]                                    # (1, NQ, 1, D)
             # Decode mode: no causal mask. The new query sees the full past.
             # Same CUDA(FA2)/CPU(SDPA) split as the single-cache path.
+            bias_i = biases[i]
             if q_i.is_cuda:
                 from src.engine.kernels.flash_attention import flash_attention_forward
-                out_i = flash_attention_forward(q_i, k_i, v_i, causal=False)
+                # attn_mask is the kernel's (S_q, S_k) additive-bias path; here
+                # S_q == 1 and bias_i is (1, S_k), so it lines up exactly.
+                out_i = flash_attention_forward(
+                    q_i, k_i, v_i, causal=False, attn_mask=bias_i)
             else:
-                out_i = F.scaled_dot_product_attention(q_i, k_i, v_i, is_causal=False)
+                out_i = F.scaled_dot_product_attention(
+                    q_i, k_i, v_i, is_causal=False,
+                    attn_mask=None if bias_i is None else bias_i.to(q_i.dtype))
             attn_outs.append(out_i)                            # (1, NQ, 1, D)
 
         # 5) Re-batch and project out. Back to a single GEMM for o_proj.

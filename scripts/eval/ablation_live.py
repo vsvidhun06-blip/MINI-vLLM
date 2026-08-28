@@ -208,14 +208,38 @@ def _serve(sched, specs, *, controller=None, tracker=None, tuner=None,
     phase1 = [s for s in specs if s.phase == 1]
     submit_time, first_tok, last_tok, tok_count = {}, {}, {}, {}
 
+    # PHASE 10 instrumentation: per-stage timestamps, so TTFT can be decomposed
+    # into (queue wait) + (prefill) rather than reported as one opaque number.
+    # Under the legacy bulk dump nearly all of TTFT was queue wait, which is why
+    # an 18-second "TTFT p99" was reported for a 1.1B model on a T4.
+    stage_ts: dict[str, dict] = {}
+
     def _submit(spec) -> None:
-        submit_time[spec.rid] = time.perf_counter()
+        now = time.perf_counter()
+        submit_time[spec.rid] = now
         tok_count[spec.rid] = 0
+        stage_ts[spec.rid] = {
+            # When the generator says this request SHOULD arrive, vs when it was
+            # actually handed to the scheduler. A large gap means the harness,
+            # not the engine, was the bottleneck.
+            "arrival_target_s": getattr(spec, "arrival_offset_s", 0.0),
+            "submit_s": now - t0,
+            "queue_entry_s": now - t0,
+            "prefill_start_s": None,
+            "first_token_s": None,
+            "finish_s": None,
+        }
         sched.add_request(spec.rid, spec.prompt_ids, max_new_tokens=spec.max_new,
                           eos_token_id=None)
 
     t0 = time.perf_counter()
-    for spec in phase0:
+    # Requests whose arrival_offset_s is 0 go in immediately (this is the legacy
+    # bulk-dump behaviour when every offset is 0). Anything with a positive
+    # offset is held in `not_yet` and released by the step loop when due, which
+    # is what turns this into an open-loop arrival process.
+    phase0_sorted = sorted(phase0, key=lambda s: getattr(s, "arrival_offset_s", 0.0))
+    not_yet = [s for s in phase0_sorted if getattr(s, "arrival_offset_s", 0.0) > 0.0]
+    for spec in [s for s in phase0_sorted if getattr(s, "arrival_offset_s", 0.0) <= 0.0]:
         _submit(spec)
 
     records: list[dict] = []
@@ -234,7 +258,23 @@ def _serve(sched, specs, *, controller=None, tracker=None, tuner=None,
     phase1_done = (len(phase1) == 0)
     last_step_t = time.perf_counter()
 
-    while sched.has_work():
+    while sched.has_work() or not_yet:
+        # Release every arrival that has come due. Done BEFORE step() so a
+        # request that arrives during an idle gap is admitted on the next step
+        # rather than a step later.
+        if not_yet:
+            elapsed = time.perf_counter() - t0
+            while not_yet and not_yet[0].arrival_offset_s <= elapsed:
+                _submit(not_yet.pop(0))
+            if not sched.has_work() and not_yet:
+                # Genuinely idle: the engine has drained and the next request has
+                # not arrived. Sleep until it does. This idle time COUNTS toward
+                # wall clock, which is exactly why an open-loop arrival process
+                # yields an arrival-bounded throughput rather than an
+                # engine-bounded one.
+                time.sleep(max(0.0, not_yet[0].arrival_offset_s - (time.perf_counter() - t0)))
+                continue
+
         emitted = sched.step()
         now = time.perf_counter()
         dt = now - last_step_t
@@ -253,6 +293,8 @@ def _serve(sched, specs, *, controller=None, tracker=None, tuner=None,
         for rid, _tok in emitted:
             if rid not in first_tok:
                 first_tok[rid] = now
+                if rid in stage_ts:
+                    stage_ts[rid]["first_token_s"] = now - t0
             last_tok[rid] = now
             tok_count[rid] += 1
             total_tokens += 1
@@ -263,7 +305,12 @@ def _serve(sched, specs, *, controller=None, tracker=None, tuner=None,
             n = tok_count[rid]
             ttft_ms = (first_tok[rid] - submit_time[rid]) * 1000.0
             tpot_ms = ((last_tok[rid] - first_tok[rid]) / (n - 1) * 1000.0) if n > 1 else 0.0
-            rec = dict(meta[rid], tokens_generated=n, ttft_ms=ttft_ms, tpot_ms=tpot_ms)
+            if rid in stage_ts:
+                stage_ts[rid]["finish_s"] = now - t0
+            rec = dict(meta[rid], tokens_generated=n, ttft_ms=ttft_ms, tpot_ms=tpot_ms,
+                       stage_timestamps=stage_ts.get(rid),
+                       queue_wait_ms=((first_tok[rid] - submit_time[rid]) * 1000.0
+                                      if rid in first_tok else None))
             records.append(rec)
             if tracker is not None:
                 tracker.record_request(ttft_ms, tpot_ms)

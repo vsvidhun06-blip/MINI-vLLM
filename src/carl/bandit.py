@@ -189,6 +189,111 @@ class LinUCBBandit:
 
 
 # ---------------------------------------------------------------------------
+# RepairedLinUCBBandit -- why plain LinUCB above cannot explore here.
+# ---------------------------------------------------------------------------
+#
+# MEASURED DEFECT (docs/eval/raw/repair/bandit_null_check.json, 5/5 seeds):
+# at alpha=0.5 the bandit above selects arm 0 on 100% of decisions and CARL's
+# output is bit-identical to a stateless DEFAULT_CONFIGS lookup. The UCB trace
+# shows exactly why. At cycle 19 of a NON-STATIONARY run:
+#
+#     arm 0    : exploit 0.609 + explore 0.108 = 0.717
+#     untried  : exploit 0.000 + explore 0.254 = 0.254
+#
+# Two compounding causes:
+#
+#   1. REWARDS ARE STRICTLY POSITIVE AND UNSHIFTED (utility() returns ~[0,1],
+#      observed mean ~0.78). An untried arm has b = 0, hence theta = 0, hence
+#      exploit = 0. Zero is not an OPTIMISTIC prior here, it is a PESSIMISTIC
+#      one: it asserts the untried arm is worth less than every observed reward.
+#      LinUCB's optimism is supposed to come from the confidence radius, which
+#      must therefore out-vote the entire reward scale.
+#
+#   2. THE CONTEXT NORM IS SMALL. state._FEATURE_SCALES divides by generous
+#      characteristic scales, gpu_utilization reads 0.0 off-GPU, and several
+#      features sit near 0.03. Measured ||x|| ranges 0.14-1.24, mean 0.83. The
+#      confidence radius is alpha*sqrt(x^T A^-1 x) <= alpha*||x||, so the entire
+#      exploration budget is ~0.5*alpha.
+#
+#   Exploration therefore requires alpha*||x|| >~ mean_reward, i.e. alpha >~ 1.5
+#   at this scaling. The paper uses 0.5. And at alpha >= 1.0 the OLD cost model
+#   punished every deviation (its optimum was arm 0 by construction), so the
+#   alpha sweep read as "exploration is harmful" when it actually read
+#   "deviating from the answer key is harmful".
+#
+# THE REPAIR (both are textbook LinUCB practice, neither is tuning-to-win):
+#
+#   a. INTERCEPT FEATURE. Append a constant 1.0 to the context, so ||x|| >= 1
+#      and the confidence radius is commensurate with the reward scale. This is
+#      standard for linear bandits and additionally lets each arm learn a
+#      context-independent baseline value, which the original could not express.
+#
+#   b. REWARD CENTRING. Fit on (r - r_bar), where r_bar is the running mean of
+#      all rewards seen by this bandit. Now an untried arm's theta = 0 encodes
+#      "worth the average", which is the correct neutral prior, instead of
+#      "worth zero". Selection adds r_bar back so scores stay interpretable.
+#
+# Both repairs are OFF in LinUCBBandit and ON here, so the two can be compared
+# head-to-head rather than one silently replacing the other. See
+# scripts/eval/repair/rule_only_ablation.py, which reports both.
+# ---------------------------------------------------------------------------
+
+
+class RepairedLinUCBBandit(LinUCBBandit):
+    """LinUCB with an intercept feature and mean-centred rewards.
+
+    Interface-compatible with LinUCBBandit: construct with the SAME `d` as the
+    observer's FEATURE_DIM; the intercept is appended internally, so callers do
+    not need to know the internal dimension.
+    """
+
+    def __init__(self, n_arms: int, d: int, alpha: float = 0.5,
+                 use_intercept: bool = True, center_rewards: bool = True) -> None:
+        self.use_intercept = bool(use_intercept)
+        self.center_rewards = bool(center_rewards)
+        self._outer_d = d
+        super().__init__(n_arms, d + (1 if self.use_intercept else 0), alpha)
+        # Running reward mean (Welford-free: a plain running average is enough
+        # for a centring constant, and keeps the update O(1)).
+        self._reward_sum = 0.0
+        self._reward_n = 0
+
+    @property
+    def reward_baseline(self) -> float:
+        """Current running mean reward; 0.0 before anything has been observed."""
+        return (self._reward_sum / self._reward_n) if self._reward_n else 0.0
+
+    def _context(self, context) -> np.ndarray:
+        """Coerce to array and append the intercept, validating the OUTER dim."""
+        x = np.asarray(context, dtype=np.float64).reshape(-1)
+        if x.shape[0] == self.d:
+            # Already the internal dimension (e.g. re-fed from our own trace).
+            return x
+        if x.shape[0] != self._outer_d:
+            raise ValueError(
+                f"context dim {x.shape[0]} != bandit d {self._outer_d}")
+        if self.use_intercept:
+            x = np.concatenate([x, np.ones(1, dtype=np.float64)])
+        return x
+
+    def ucb_scores(self, context) -> np.ndarray:
+        """UCB scores with the reward baseline added back for interpretability."""
+        return super().ucb_scores(context) + self.reward_baseline
+
+    def update(self, arm: int, reward: float, context) -> None:
+        """Fold in an observation, fitting on the centred residual."""
+        r = float(reward)
+        # Centre against the baseline BEFORE this sample is folded in, so the
+        # residual is an honest prediction error rather than partially explained
+        # by the observation itself.
+        residual = r - self.reward_baseline if self.center_rewards else r
+        self._reward_sum += r
+        self._reward_n += 1
+        super().update(arm, residual, context)
+
+
+
+# ---------------------------------------------------------------------------
 # ThompsonSamplingBandit (ablation)
 # ---------------------------------------------------------------------------
 #

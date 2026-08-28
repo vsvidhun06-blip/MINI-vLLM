@@ -447,7 +447,13 @@ class ContinuousBatchScheduler:
         if self._cuda_graph_observer is not None:
             self._cuda_graph_observer(True)   # graph hit
         # The graph runs under its own captured no_grad context.
-        return self._graph_runner.replay(input_ids, caches)
+        #
+        # `routing_plan` is handed to replay() rather than left for it to
+        # re-derive. The plan is what `can_replay` just authorised this batch
+        # against; a replay that recomputed it would be resolving a key nobody
+        # checked, which is precisely how a routed batch could end up served by
+        # a graph captured under a different adapter mix.
+        return self._graph_runner.replay(input_ids, caches, routing_plan)
 
     def _eager_decode(
         self,

@@ -87,6 +87,72 @@ Any (batch size, bucket) pair that was not captured -- including because capture
 itself failed, e.g. OOM -- is an eager fallback, counted separately and never
 reported as a graph hit. `fallback_reasons` records why.
 
+  * LORA ROUTING PLAN. A third dimension, and the one that is easiest to get
+    wrong, because it is invisible in the tensor shapes. `LoRALinear.forward`
+    branches on `self._active`: base rows take the zero-overhead path (one
+    GEMM), a single active adapter takes `_apply_single`, and a mixed batch
+    takes `_apply_per_row`. Capture freezes whichever branch was live, together
+    with that adapter's weight tensors and, for `_apply_per_row`, the row-index
+    tensors. A graph captured under plan P therefore computes P's arithmetic no
+    matter what the scheduler later routes -- replaying it under plan Q would
+    silently serve Q's requests with P's adapters.
+
+    So the routing plan is part of GRAPH IDENTITY, not a property checked
+    alongside it:
+
+        key = (batch_size, n_blocks, canonical_routing_plan)
+
+    canonicalised by `src.engine.lora.normalize_routing_plan` -- the same
+    function `model_routing_plan` uses, so the scheduler and this module cannot
+    disagree about what plan is live. `None` is base, a `str` is one adapter for
+    every row, and a tuple is per-row routing; an all-`None` tuple collapses to
+    `None`, because "every row is base" IS base. Tuples (never lists) so the
+    plan can be part of a dict key.
+
+    A T4 established that capture under an active per-row plan SUCCEEDS
+    (16/16 graphs, 1.324s, zero capture failures), which is what makes routed
+    graphs worth having at all; see `test_cuda_capture_under_active_per_row_routing`.
+
+ON-DEMAND CAPTURE OF ROUTED PLANS
+---------------------------------
+`capture_all()` runs before any request is admitted, so it necessarily captures
+the UNROUTED plan: nothing is routed yet. That is the right default -- base
+decode is the common case -- but it cannot cover routing, because which adapter
+combinations will share a decode batch is a property of the arrival pattern and
+the scheduler's batching, not something a caller can enumerate up front.
+
+So a routed plan is captured the first time it is actually encountered, from the
+very step that needs it, and reused for every later step with the same plan.
+
+The capture-time hazard that makes `capture_all()` demand an empty pool does not
+apply here, and the reason is worth being precise about.
+
+`capture_all()` stages PLACEHOLDER metadata -- block 0, slot 0, context 0 --
+because it has no real batch to point at. Those writes land on whoever owns
+block 0, which is why it may only run on an empty pool.
+
+An on-demand capture stages the LIVE batch's metadata instead, so its writes go
+to the slot THIS decode step is already going to overwrite. The token ids staged
+for capture are placeholder zeros (`can_replay` is not given the real ones, and
+a graph does not bake token VALUES anyway -- only the address of
+`static_input`), so during capture that slot transiently holds the K/V of token
+0 rather than of the real token. That is safe because of what happens next, and
+only because of it: this step then either replays the graph just captured or --
+if the capture failed -- runs eager, and both write the correct K/V to that same
+slot, computed from the same pre-append `_seq_lens`, before anything reads it.
+The transient value is never observable.
+
+`commit()` is NOT called by capture; only `replay` advances the host-side
+`_seq_lens`, exactly once, so the context bookkeeping cannot double-step.
+
+Routed graphs are capped by `max_routed_graphs`. Adapter combinations grow
+combinatorially and each graph pins a static-buffer set plus its share of the
+memory pool; past the cap, further plans are counted eager fallbacks
+(`routed_graph_budget_exhausted`) rather than being allowed to exhaust device
+memory mid-serve. A capture that fails for any other reason (OOM included) is
+caught, counted as `routed_capture_failed`, and the step runs eager -- an
+on-demand capture must never be able to take down a live server.
+
 CAPTURE ORDERING CONSTRAINT
 ---------------------------
 `capture_all()` must run BEFORE any request is admitted to the pool. Capture and
@@ -109,11 +175,16 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from src.engine.lora import normalize_routing_plan
+
 if TYPE_CHECKING:
     from src.engine.kv_cache import PagedKVCache, PagedRequestCache
     from src.engine.model import LlamaModel
 
 NEG_INF = float("-inf")
+
+# "argument omitted", which is not the same as the routing plan `None` (base).
+_UNSET = object()
 
 
 class GraphCaptureError(RuntimeError):
@@ -404,45 +475,88 @@ class DecodeGraphRouter:
     def _note(self, reason: str) -> None:
         self.fallback_reasons[reason] = self.fallback_reasons.get(reason, 0) + 1
 
-    def _resolve(self, batch_size: int, caches: list, routing_plan=None) -> "tuple[int, int] | None":
-        """The (batch size, bucket) graph key for this decode batch, or None.
+    def _bucket_for(self, batch_size: int, caches: list, *, note: bool = True):
+        """The block bucket that fits this decode batch, or None.
 
-        None means "run eager"; the reason is recorded. Returning a key is a
-        promise that `replay` will succeed for this exact batch.
+        Split out of `_resolve` so on-demand capture can ask "which bucket would
+        this batch use?" WITHOUT recording a fallback -- a capture that is about
+        to succeed must not leave a refusal in `fallback_reasons`, or the
+        diagnostics stop summing to one entry per decode forward.
         """
-        if batch_size not in self.batch_sizes:
-            self._note("batch_size_not_captured")
+        def _refuse(reason: str):
+            if note:
+                self._note(reason)
             return None
+
+        if batch_size not in self.batch_sizes:
+            return _refuse("batch_size_not_captured")
         bs = self.pool.block_size
         need = 1
         for c in caches:
             if getattr(c, "pool", None) is not self.pool:
-                self._note("foreign_kv_pool")
-                return None
+                return _refuse("foreign_kv_pool")
             seq_lens = getattr(c, "_seq_lens", None)
             if not seq_lens:
-                self._note("no_seq_lens")
-                return None
+                return _refuse("no_seq_lens")
             lo, hi = min(seq_lens), max(seq_lens)
             if lo != hi:
                 # Mid-forward state (some layers appended, some not). A graph
                 # writes every layer at one context, so eager is the only
                 # correct option here.
-                self._note("ragged_layer_seq_lens")
-                return None
+                return _refuse("ragged_layer_seq_lens")
             need = max(need, (hi + 1 + bs - 1) // bs)
         for nb in self.buckets:
             if nb >= need:
-                key = (batch_size, nb)
-                if key in self.graphs:
-                    captured_plan = getattr(self, "graph_plans", {}).get(key, None)
-                    if routing_plan != captured_plan:
-                        self._note("lora_routing_mismatch")
-                        return None
-                    return key
-                self._note("bucket_capture_failed")
-                return None
-        self._note("context_exceeds_largest_bucket")
+                return nb
+        return _refuse("context_exceeds_largest_bucket")
+
+    def _lookup(self, batch_size: int, n_blocks: int, plan):
+        """The key into `self.graphs` for this shape AND plan, or None.
+
+        Two key layouts are supported on purpose:
+
+          * ROUTED (what `LiveDecodeGraphRunner` writes): a 3-tuple
+            `(batch_size, n_blocks, plan)`, so a plan mismatch is simply a
+            missing key and no graph captured under another plan is even
+            reachable by lookup.
+          * LEGACY: a 2-tuple `(batch_size, n_blocks)` whose plan lives in the
+            optional `graph_plans` side table. CPU test doubles that only
+            populate `self.graphs` use this, and the absent-table case degrades
+            to "captured under None", which is what an unrouted double means.
+
+        `plan` must already be canonical.
+        """
+        k3 = (batch_size, n_blocks, plan)
+        if k3 in self.graphs:
+            return k3
+        k2 = (batch_size, n_blocks)
+        if k2 in self.graphs:
+            captured = getattr(self, "graph_plans", {}).get(k2, None)
+            return k2 if normalize_routing_plan(captured) == plan else None
+        return None
+
+    def _resolve(self, batch_size: int, caches: list, routing_plan=None):
+        """The graph key for this decode batch, or None.
+
+        None means "run eager"; the reason is recorded. Returning a key is a
+        promise that `replay` will succeed for this exact batch -- INCLUDING
+        that the graph behind it was captured under this exact routing plan.
+        """
+        nb = self._bucket_for(batch_size, caches)
+        if nb is None:
+            return None
+        plan = normalize_routing_plan(routing_plan)
+        key = self._lookup(batch_size, nb, plan)
+        if key is not None:
+            return key
+        # Nothing serves this batch. Distinguish "this shape was never
+        # captured" from "this shape exists, but only under other routing
+        # plans" -- they have completely different fixes, and conflating them
+        # is what made the original zero-hit runs unreadable.
+        shape_exists = any(
+            k[0] == batch_size and k[1] == nb for k in self.graphs)
+        self._note("lora_routing_mismatch" if shape_exists
+                   else "bucket_capture_failed")
         return None
 
     def can_replay(self, batch_size: int, caches: "list | None" = None, routing_plan=None) -> bool:
@@ -453,26 +567,72 @@ class DecodeGraphRouter:
 
     # ---- reporting ---------------------------------------------------------
 
+    @staticmethod
+    def _plan_str(plan) -> str:
+        """A routing plan as a stable, JSON-safe, sortable string.
+
+        Graph keys mix `None`, `str` and `tuple` plans, which are not mutually
+        orderable in Python 3, so neither `sorted(self.graphs)` nor a JSON dump
+        of the raw keys works. Every artifact consumer reads this instead.
+        """
+        if plan is None:
+            return "base"
+        if isinstance(plan, str):
+            return plan
+        return "[" + ",".join("base" if p is None else str(p) for p in plan) + "]"
+
+    def _key_str(self, key) -> list:
+        """One graph key as `[batch_size, n_blocks, plan_str]`."""
+        plan = key[2] if len(key) > 2 else getattr(self, "graph_plans", {}).get(key)
+        return [key[0], key[1], self._plan_str(normalize_routing_plan(plan))]
+
     def report(self) -> dict:
+        keys = [self._key_str(k) for k in self.graphs]
+        keys.sort(key=lambda k: (k[0], k[1], k[2]))
+        plans = sorted({k[2] for k in keys})
         return {
             "graphs_captured": len(self.graphs),
-            "graph_keys": [list(k) for k in sorted(self.graphs.keys())],
+            "graph_keys": keys,
+            "routing_plans_captured": plans,
+            "graphs_per_routing_plan": {
+                p: sum(1 for k in keys if k[2] == p) for p in plans},
             "batch_sizes": list(self.batch_sizes),
             "block_buckets": list(self.buckets),
             "block_size": self.pool.block_size,
             "max_context_tokens": self.max_context_tokens,
             "capture_seconds": self._capture_seconds,
             "capture_failures": list(self.capture_failures),
+            # On-demand routed capture; absent on the base router and on CPU
+            # doubles, which never capture anything.
+            "routed_plans_captured": [
+                self._plan_str(p) for p in getattr(self, "routed_plans", [])],
+            "max_routed_graphs": getattr(self, "max_routed_graphs", None),
+            "routed_capture_failures": list(
+                getattr(self, "routed_capture_failures", [])),
+            # Promoted to the top of the report on purpose. A routed capture
+            # that throws every step produces a zero hit rate that is
+            # indistinguishable, in the hit count alone, from the routing guard
+            # doing its job -- so the first exception is carried where a reader
+            # cannot miss it rather than left at the bottom of a failure list.
+            "first_routed_capture_error": (
+                getattr(self, "routed_capture_failures", [None])[0]["error"]
+                if getattr(self, "routed_capture_failures", None) else None),
         }
 
 
 class LiveDecodeGraphRunner(DecodeGraphRouter):
     """Captures and replays real decode steps for a live scheduler.
 
-    Implements the `can_replay(batch_size, caches)` / `replay(input_ids, caches)`
-    protocol `ContinuousBatchScheduler._decode_forward` already calls, so
-    attaching one to `scheduler._graph_runner` is the whole integration -- the
-    scheduler itself is unchanged.
+    Implements the `can_replay(batch_size, caches, routing_plan)` /
+    `replay(input_ids, caches, routing_plan)` protocol
+    `ContinuousBatchScheduler._decode_forward` already calls, so attaching one
+    to `scheduler._graph_runner` is the whole integration.
+
+    The routing plan is threaded through both calls rather than re-derived from
+    the model here. Re-deriving would reintroduce exactly the gap this guard
+    exists to close: the scheduler sets the batch's routing, reads the plan, and
+    then calls in, and only a plan carried unchanged across that boundary is
+    guaranteed to describe the batch that is about to run.
     """
 
     WARMUP_ITERS = 3
@@ -486,6 +646,7 @@ class LiveDecodeGraphRunner(DecodeGraphRouter):
         max_context_tokens: int,
         num_seq_buckets: int = 4,
         max_graph_batch: int = 32,
+        max_routed_graphs: int = 16,
     ) -> None:
         device = pool.K_pool.device
         if device.type != "cuda":
@@ -508,11 +669,29 @@ class LiveDecodeGraphRunner(DecodeGraphRouter):
         self.model = model
         self.device = device
         self._mempool = None
+        self.max_routed_graphs = int(max_routed_graphs)
+        # Plans captured on demand, in first-seen order. `None` is captured by
+        # capture_all() and is not counted against the routed budget.
+        self.routed_plans: list = []
+        self.routed_capture_failures: list[dict] = []
 
     # ---- capture -----------------------------------------------------------
 
-    def capture_all(self, *, require_all: bool = True) -> dict:
-        """Capture the full (batch size x context bucket) grid.
+    def capture_all(self, *, require_all: bool = True, routing_plan=_UNSET) -> dict:
+        """Capture the full (batch size x context bucket) grid for ONE plan.
+
+        `routing_plan` defaults to THE MODEL'S CURRENT PLAN, read here rather
+        than assumed to be `None`. Called at the documented point -- before any
+        request is admitted -- that is base, because nothing is routed yet. But
+        a caller may route the model first and capture under that plan, and a
+        default of `None` would then record "base" for graphs that actually
+        froze an adapter's arithmetic: precisely the mislabelling this key is
+        supposed to prevent, reintroduced at the capture site. What is recorded
+        must be what was executed, so it is derived from the same source the
+        scheduler reads.
+
+        The plan is canonicalised and recorded as part of every key this call
+        writes, so a later batch routed differently cannot reach these graphs.
 
         FAILS LOUDLY BY DEFAULT. The previous version of this method recorded
         every capture exception and carried on, which meant a grid where EVERY
@@ -525,19 +704,25 @@ class LiveDecodeGraphRunner(DecodeGraphRouter):
 
         Nothing is ever labelled a graph hit because a capture was attempted.
         """
+        from src.engine.lora_model import model_routing_plan
+        if routing_plan is _UNSET:
+            routing_plan = model_routing_plan(self.model)
+        plan = normalize_routing_plan(routing_plan)
         t0 = time.perf_counter()
         for b in self.batch_sizes:
             for nb in self.buckets:
                 try:
-                    self._capture(b, nb)
+                    self._capture(b, nb, plan)
                 except Exception as exc:                      # noqa: BLE001
                     self.capture_failures.append(
                         {"batch_size": b, "n_blocks": nb,
+                         "routing_plan": self._plan_str(plan),
                          "error": f"{type(exc).__name__}: {exc}"})
                     if require_all:
                         raise GraphCaptureError(
                             f"CUDA graph capture failed for batch_size={b}, "
-                            f"n_blocks={nb} after {len(self.graphs)} successful "
+                            f"n_blocks={nb}, routing_plan="
+                            f"{self._plan_str(plan)} after {len(self.graphs)} successful "
                             f"captures: {type(exc).__name__}: {exc}\n"
                             f"Refusing to continue: an uncaptured shape becomes "
                             f"an eager decode step, and a graph arm assembled "
@@ -576,6 +761,7 @@ class LiveDecodeGraphRunner(DecodeGraphRouter):
 
     def _self_test_one(self, batch_size: int, tolerance: float) -> dict:
         from src.engine.kv_cache import PagedRequestCache
+        from src.engine.lora_model import model_routing_plan
 
         pool = self.pool
         cfg = self.model.config
@@ -606,7 +792,11 @@ class LiveDecodeGraphRunner(DecodeGraphRouter):
             k_before = pool.K_pool.clone()
             v_before = pool.V_pool.clone()
 
-            if not self.can_replay(batch_size, caches):
+            # Resolve with the model's live plan, exactly as the scheduler
+            # does -- a self-test that used a different plan than production
+            # would prove nothing about production.
+            plan = model_routing_plan(self.model)
+            if not self.can_replay(batch_size, caches, plan):
                 raise GraphSelfTestError(
                     f"can_replay() refused a live decode batch of size "
                     f"{batch_size} at context {seq_lens_before[0][0]}. Runner "
@@ -625,7 +815,7 @@ class LiveDecodeGraphRunner(DecodeGraphRouter):
                 c._seqlen_tensors.clear()          # noqa: SLF001
                 c._seqlen_vals.clear()             # noqa: SLF001
 
-            graphed = self.replay(step_ids, caches)
+            graphed = self.replay(step_ids, caches, plan)
 
             delta = (graphed.float() - eager.float()).abs().max().item()
             if delta > tolerance:
@@ -644,9 +834,29 @@ class LiveDecodeGraphRunner(DecodeGraphRouter):
             for rid in rids:
                 pool.free_request(rid)
 
-    def _capture(self, batch_size: int, n_blocks: int) -> None:
+    def _capture(self, batch_size: int, n_blocks: int, plan=None,
+                 caches: "list | None" = None) -> None:
+        """Capture one graph for (batch_size, n_blocks) under `plan`.
+
+        `caches` is the live decode batch when this is an on-demand capture, and
+        None during `capture_all()`. With a live batch we stage ITS metadata, so
+        the warmup and capture writes land on the slot this step is about to
+        overwrite anyway, rather than on block 0 and whichever request owns it.
+        The staged token ids are zeros; see the module docstring for why that is
+        safe (the caller always rewrites the slot before it is read).
+
+        The caller is responsible for having the model routed to `plan` already:
+        capture freezes whatever branch `LoRALinear.forward` takes, so the plan
+        recorded in the key is only honest if the model was actually routed that
+        way while the capture ran.
+        """
         state = StaticDecodeBatch(self.pool, batch_size, n_blocks)
-        state.stage_placeholder()
+        if caches is None:
+            state.stage_placeholder()
+        else:
+            state.stage(input_ids=torch.zeros((batch_size, 1), dtype=torch.long,
+                                              device=self.device),
+                        caches=caches)
 
         # Warmup on a side stream is required by the capture protocol, and the
         # FIRST CUDA decode forward also JIT-compiles/autotunes the Triton RoPE
@@ -666,17 +876,101 @@ class LiveDecodeGraphRunner(DecodeGraphRouter):
         if self._mempool is None:
             self._mempool = graph.pool()
 
-        self.graphs[(batch_size, n_blocks)] = (graph, state, static_logits)
+        # B2: the plan is part of the KEY, not a side table. A batch routed
+        # differently cannot reach this graph by lookup at all.
+        self.graphs[(batch_size, n_blocks, plan)] = (graph, state, static_logits)
 
     # ---- replay ------------------------------------------------------------
 
-    def replay(self, input_ids: torch.Tensor, caches: list) -> torch.Tensor:
-        """Serve one decode step from a captured graph. Returns (B, 1, vocab)."""
-        key = self._resolve(len(caches), caches)
+    def can_replay(self, batch_size: int, caches: "list | None" = None,
+                   routing_plan=None) -> bool:
+        """True iff a captured graph can serve exactly this decode batch.
+
+        Extends the base router with ON-DEMAND capture: when the batch is
+        servable in every respect except that no graph exists yet for its
+        routing plan, capture one now, from this batch, and serve it. See the
+        module docstring for why capturing against the live batch is safe here
+        while `capture_all()` requires an empty pool.
+        """
+        if caches is None:
+            return any(k[0] == batch_size for k in self.graphs)
+        plan = normalize_routing_plan(routing_plan)
+        # Probe WITHOUT recording a reason: if the capture below succeeds this
+        # step is a hit, and a hit must not also leave a fallback behind.
+        nb = self._bucket_for(batch_size, caches, note=False)
+        if nb is not None and self._lookup(batch_size, nb, plan) is None:
+            if not self._capture_on_demand(batch_size, nb, plan, caches):
+                # Capture was attempted for this exact key and did not produce a
+                # graph. The specific reason is already recorded, so return here
+                # rather than falling through to `_resolve`.
+                #
+                # Falling through was a real defect, and an expensive one. It
+                # added a SECOND reason for one decode forward -- breaking this
+                # module's "exactly one reason per batched-decode forward"
+                # contract -- and the reason it added was `lora_routing_mismatch`,
+                # which means "a graph exists for this shape under a DIFFERENT
+                # plan and we refused to reuse it". That is the guard working. A
+                # CUDA capture that threw is not the guard working, and labelling
+                # it that way sent a T4 investigation after a routing bug that
+                # did not exist while the actual exception sat unread in
+                # `routed_capture_failures`.
+                return False
+        return self._resolve(batch_size, caches, routing_plan) is not None
+
+    def _capture_on_demand(self, batch_size: int, n_blocks: int, plan,
+                           caches: list) -> bool:
+        """Capture the graph this decode batch needs, or leave it uncaptured.
+
+        Returns True when the caller should go on to resolve normally, and
+        False when this call has already recorded the reason this step cannot
+        be a graph hit. That distinction is what keeps exactly one reason per
+        batched-decode forward.
+
+        Never raises: an on-demand capture happens inside a live serving loop,
+        and a failure there must degrade to an eager step, not take the server
+        down. But it is never silent either -- the exception text is kept
+        verbatim in `routed_capture_failures` and surfaced through `report()`,
+        because "the graph arm is slow" and "every routed capture is throwing"
+        look identical in a hit rate alone.
+        """
+        if plan is None:
+            # The unrouted grid is capture_all()'s job. Reaching here means that
+            # shape genuinely failed to capture; let `_resolve` say so.
+            return True
+        if plan not in self.routed_plans:
+            if len(self.routed_plans) >= self.max_routed_graphs:
+                self._note("routed_graph_budget_exhausted")
+                return False
+            self.routed_plans.append(plan)
+        try:
+            torch.cuda.synchronize()
+            self._capture(batch_size, n_blocks, plan, caches=caches)
+            return True
+        except Exception as exc:                              # noqa: BLE001
+            self.routed_capture_failures.append(
+                {"batch_size": batch_size, "n_blocks": n_blocks,
+                 "routing_plan": self._plan_str(plan),
+                 "error": f"{type(exc).__name__}: {exc}"})
+            self._note("routed_capture_failed")
+            return False
+
+    def replay(self, input_ids: torch.Tensor, caches: list,
+               routing_plan=None) -> torch.Tensor:
+        """Serve one decode step from a captured graph. Returns (B, 1, vocab).
+
+        B3: `routing_plan` is the plan the caller has already established for
+        this batch, and it is resolved with -- not recomputed. Resolving without
+        it would look up a DIFFERENT key than the `can_replay` that authorised
+        this call, which is how a routed batch could be served by the unrouted
+        graph.
+        """
+        key = self._resolve(len(caches), caches, routing_plan)
         if key is None:
             raise RuntimeError(
-                "replay() called for a decode batch no captured graph can "
-                "serve; the caller must consult can_replay() first")
+                f"replay() called for a decode batch no captured graph can "
+                f"serve (batch_size={len(caches)}, routing_plan="
+                f"{self._plan_str(normalize_routing_plan(routing_plan))}); "
+                f"the caller must consult can_replay() first")
         graph, state, static_logits = self.graphs[key]
         state.stage(input_ids, caches)
         graph.replay()
